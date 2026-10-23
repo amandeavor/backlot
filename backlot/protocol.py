@@ -1,5 +1,6 @@
-"""The HTTP/1.1 protocol `backlot serve` hands uvicorn: uvicorn's own httptools protocol, with each
-request line read before its parser reads it.
+"""The HTTP/1.1 protocol `backlot serve` hands uvicorn: uvicorn's own httptools protocol, which
+reads a request line that starts a read from the socket before its parser does (:class:`Protocol`
+says which).
 
 httptools refuses a request target holding one of the bytes :mod:`backlot.request_target` names,
 in the path or in the query, and uvicorn answers the refusal itself with a 400 reading

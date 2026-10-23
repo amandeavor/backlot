@@ -2,7 +2,8 @@
 
 A client library percent-encodes such a byte or refuses to send it, and the TestClient would too,
 so each request here is written to a socket by hand, to the server ``live_server`` starts with
-``backlot serve``. Each row names the vendor host whose measured answer it holds.
+``backlot serve``. A single-byte row names the vendor host whose measured answer it holds; a pair
+row names its path, measured on the first host of its family (`_PAIRS`).
 """
 
 from __future__ import annotations
@@ -32,7 +33,8 @@ _KINDS = {
 _AS = {"del": "control", "ff": "lone"}
 
 # What the front door answers each kind with, in the path and in a query value. `encoded` is the
-# answer to the request with the byte percent-encoded, `?` the one with each byte read as a `?`.
+# answer to the request with the byte percent-encoded, `?` the one with each high byte in the path
+# read as a `?` and the other bytes percent-encoded.
 _GOOGLE = dict.fromkeys(("utf-8", "lone"), "encoded") | {
     "control": "google 54",
     "nul": "google 54",
@@ -218,6 +220,14 @@ def test_a_raw_byte_in_the_target_is_answered_as_the_vendors_front_door_answers_
         return
     want_status, want_type, want_body = _page(answer, target)
     assert (status, headers.get("content-type"), body) == (want_status, want_type, want_body)
+    # the edge's page carries the edge's two headers beside its own, CloudFront's neither
+    edge = {"x-content-type-options": "nosniff", "x-xss-protection": "1; mode=block"}
+    if answer.startswith("edge "):
+        assert {k: headers.get(k) for k in [*edge, "access-control-allow-origin"]} == edge | {
+            "access-control-allow-origin": "*"
+        }
+    else:
+        assert not edge.keys() & headers.keys()
 
 
 @pytest.mark.parametrize(

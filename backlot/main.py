@@ -1228,7 +1228,7 @@ async def put_a_request_id_on_github_answers(request: Request, call_next):
 async def answer_a_raw_byte_in_the_request_target(request: Request, call_next):
     """Answer a request whose target held a raw byte ``backlot.protocol`` percent-encoded as the
     vendor's front door answers it (``backlot.request_target.answer``), or hand it on as the request
-    with the byte encoded where the front door reads it that way.
+    the front door reads it as.
 
     Registered after every vendor's middleware but the JSON media type's, so it answers ahead of
     each of them, as a front door answers ahead of the API behind it.

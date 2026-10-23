@@ -3,11 +3,13 @@ or from 0x7F to 0xFF, other than the LF that ends the line.
 
 :mod:`backlot.protocol` percent-encodes those bytes before uvicorn's parser reads the line and puts
 the target as sent on the scope under :data:`SENT`, where :func:`answer` reads it. A front door
-either refuses such a target with an answer of its own or reads it as the request with the bytes
-percent-encoded, which the app then answers as it answers that request. Which one, and with what,
-turns on the kind of each byte (:func:`_kind`), on whether it is in the path or the query, and on
-the other bytes beside it. A refusal here carries the front door's status, media type and body;
-its other headers (`server`, `CF-RAY`, the S3 ids) are not sent.
+either refuses such a target with an answer of its own or reads it as a request the app then
+answers: the bytes percent-encoded, or on S3 a path's high bytes as `?` (:func:`_s3`). Which one,
+and with what, turns on the kind of each byte (:func:`_kind`), on whether it is in the path or the
+query, and on the other bytes beside it. A refusal here carries the front door's status, media
+type and body, but for the Atlassian edge's, whose body is a stub (:func:`_atlassian`). Of its
+other headers only the Atlassian ones Backlot serves on the same layer's other answers are sent,
+not `server`, `CF-RAY` or the S3 ids.
 
 Measured on 2026-10-23 over raw HTTP/1.1 on TLS sockets, with the vendors' credentials but Slides',
 S3's and Graph's, on a path no route serves (`…/nope<byte>x`) and a query value (`?b=<byte>x`), with
@@ -25,11 +27,11 @@ import hashlib
 import re
 import urllib.parse
 
-from fastapi import Response
+from fastapi import Request, Response
 from starlette.types import Scope
 
 from backlot import errors
-from backlot.routers import s3
+from backlot.routers import atlassian, s3
 
 #: The scope key :mod:`backlot.protocol` leaves the request target on, as sent, where it
 #: percent-encoded a byte of it.
@@ -203,21 +205,31 @@ def _atlassian(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> R
         page = errors.atlassian.cdn_bad_request(
             scope["method"], scope["raw_path"].decode("latin-1")
         )
-        return _page(page.encode(), "text/html")
+        return _front_door(scope, "cdn", page, {})
     read = list(query_kinds) if "space" in every else path_kinds + query_kinds
     for kind, details in (("control", "http1.invalid_characters"), ("tab", "http1.codec_error")):
         if kind in read:
             page = errors.atlassian.edge_page(details)
-            return _page(page.encode(), "text/html", **{"Access-Control-Allow-Origin": "*"})
+            return _front_door(scope, "cdn edge", page, {"Access-Control-Allow-Origin": "*"})
     return None
+
+
+def _front_door(scope: Scope, layer: str, page: str, headers: dict[str, str]) -> Response:
+    """An Atlassian page from ``layer``, carrying what ``backlot.routers.atlassian.vendor_headers``
+    puts on that layer's answers, as ``backlot.main.answer_at_the_atlassian_front_door`` leaves
+    them to it."""
+    scope["atlassian_front_door"] = layer
+    headers |= atlassian.vendor_headers(Request(scope), 400)
+    return _page(page.encode(), "text/html", **headers)
 
 
 def _s3(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Response | None:
     """An empty 400 where a `nul` or a `cr` is anywhere, then real's 505 where a `space` is, then an
     empty 400 again where a `tab` is. A `control` is read as its percent-encoding, and so is a
     `high` in the query, and in a path whose first raw byte is a `control`; in a path whose first
-    raw byte is a `high`, each `high` is read as `?`. So the 400 for a bucket name named it: `C3 A9`
-    sent raw came back `??`, `C3 A9 01` as `??&#1;` and `01 C3 A9` as `&#1;é`."""
+    raw byte is a `high`, each `high` is read as `?`. So real's 400 `InvalidBucketName` named a
+    bucket name sent with them: `C3 A9` raw came back `??`, `C3 A9 01` as `??&#1;` and `01 C3 A9`
+    as `&#1;é`."""
     every = set(path_kinds) | set(query_kinds)
     if every & {"nul", "cr"}:
         return _page(b"", None)
@@ -260,10 +272,9 @@ def _graph(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Respo
 
 def answer(scope: Scope) -> Response | None:
     """The answer to a request whose target :mod:`backlot.protocol` encoded, or ``None`` where the
-    vendor reads the target as its percent-encoding, the scope left saying so.
+    vendor reads the target as another request, which the scope is left holding.
 
-    A path no vendor owns gets the 400 uvicorn's own protocol answers such a target with, so
-    Backlot's own routes answer as they did before the target was read here."""
+    A path no vendor owns gets the 400 uvicorn's own protocol answers such a target with."""
     path = scope["path"]
     sent_path, _, sent_query = scope[SENT].partition(b"?")
     in_path, in_query = _kinds(sent_path), _kinds(sent_query)
