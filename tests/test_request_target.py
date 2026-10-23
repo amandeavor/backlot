@@ -129,6 +129,9 @@ _PAIRS = [
     ("/atlassian/rest/api/3/", b"nope%00x\x01y", "encoded"),
     ("/atlassian/rest/api/3/", b"nope%G1x\ty", "encoded"),
     ("/atlassian/rest/api/3/", b"a/../nope\x01y", "encoded"),
+    # and the edge's own `;` and Tomcat's escaped slash behind it
+    ("/atlassian/rest/api/3/", b"nope;x\x01y", "edge invalid_characters"),
+    ("/atlassian/wiki/rest/api/", b"nope%2Fx\x01y", "edge invalid_characters"),
 ]
 
 
@@ -141,9 +144,10 @@ def _rows():
             yield pytest.param(base, b"nope?b=" + sent + b"x", query[answer], 1, id=ids[1])
     for base, rest, answer in _PAIRS:
         yield pytest.param(base, rest, answer, 1, id=f"{base} {rest!r}")
-    # `Authorization` twice, which Cloudflare refuses ahead of the bytes on these two
-    yield pytest.param("/linear/", b"nope\tx", "cloudflare page", 2, id="linear twice")
-    yield pytest.param("/fireflies/", b"nope\x01x", "cloudflare page", 2, id="fireflies twice")
+    # `Authorization` twice, which Cloudflare refuses ahead of the bytes
+    for base, sent in (("/linear/", b"\t"), ("/fireflies/", b"\x01"), ("/notion/v1/", b"\t")):
+        yield pytest.param(base, b"nope" + sent + b"x", "cloudflare page", 2, id=f"{base} twice")
+    yield pytest.param("/hubspot/crm/v3/objects/contacts/", b"nope\tx", "cloudflare page", 2)
     yield pytest.param("/_meta/", b"nope\x80x", "uvicorn", 1, id="a path no vendor owns")
 
 

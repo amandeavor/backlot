@@ -182,14 +182,12 @@ def _google(path_kinds: list[str], query_kinds: list[str]) -> Response | None:
 
 
 def _cloudflare(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Response | None:
-    """:data:`CLOUDFLARE_PAGE` where a `nul` or a `cr` is anywhere, and on Linear and Fireflies
-    where `Authorization` comes more than once (``auth.repeated_authorization``); then an empty 400
-    with no `Content-Type` for any raw byte in the query, and for one in a path that holds no
-    `space`; and a path with a `space` in it read as its percent-encoding, whatever else the path
-    holds."""
+    """:data:`CLOUDFLARE_PAGE` where a `nul` or a `cr` is anywhere, and where `Authorization` comes
+    more than once (``auth.repeated_authorization``); then an empty 400 with no `Content-Type` for
+    any raw byte in the query, and for one in a path that holds no `space`; and a path with a
+    `space` in it read as its percent-encoding, whatever else the path holds."""
     every = set(path_kinds) | set(query_kinds)
-    graphql = _under(scope["path"], "/linear") or _under(scope["path"], "/fireflies")
-    if every & {"nul", "cr"} or (graphql and auth.repeated_authorization(Request(scope))):
+    if every & {"nul", "cr"} or auth.repeated_authorization(Request(scope)):
         return _page(CLOUDFLARE_PAGE, "text/html")
     if query_kinds or "space" not in path_kinds:
         return _page(b"", None)
@@ -201,7 +199,7 @@ def _atlassian(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> R
     own refusal where ``errors.atlassian.front_door`` gives one of the CDN's or its firewall's for
     the target encoded, which ``backlot.main.answer_at_the_atlassian_front_door`` answers. The edge
     reads the query's bytes and, where the target holds no `space` at all, the path's: a `control`
-    is its page naming `http1.invalid_characters`, and a `tab` with none, the one naming
+    is its page naming `http1.invalid_characters`, and a `tab` where no `control` is, the one naming
     `http1.codec_error`. A `space`, a `high` and a path the edge does not read are read as their
     percent-encoding. Real's edge pages are 18,946 and 18,939 bytes on `text/html` with no charset,
     and the two here are :func:`backlot.errors.atlassian.edge_page`'s."""
