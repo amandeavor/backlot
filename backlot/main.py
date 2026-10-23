@@ -1201,11 +1201,12 @@ async def refuse_a_repeated_authorization_on_linear_and_fireflies(request: Reque
     a key, a key and `nope` in either order, a key and an empty value, two empty values, three
     copies and a second header named in lower case; on `POST /graphql` with a query, with no bytes,
     with `{` and with a body past each vendor's size limit, on `GET /graphql`, on `HEAD /graphql`,
-    which declared the 155 bytes and sent none, and on `POST /nosuch` and `POST /`."""
+    which declared the 155 bytes and sent none, and on `POST /nosuch` and `POST /`. Both closed the
+    connection after it (`GET /graphql`, 2026-10-23)."""
     return Response(
         request_target.CLOUDFLARE_PAGE,
         status_code=400,
-        headers={"Content-Type": "text/html"},
+        headers={"Content-Type": "text/html", "Connection": "close"},
     )
 
 
