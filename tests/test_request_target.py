@@ -1,0 +1,285 @@
+"""The raw bytes ``backlot.request_target`` answers, over a real uvicorn.
+
+A client library percent-encodes such a byte or refuses to send it, and the TestClient would too,
+so each request here is written to a socket by hand, to the server ``live_server`` starts with
+``backlot serve``. Each row names the vendor host whose measured answer it holds.
+"""
+
+from __future__ import annotations
+
+import re
+import socket
+import time
+import urllib.parse
+
+import pytest
+
+from backlot import errors, request_target
+
+_UTF8, _LONE = b"\xc3\xa9", b"\x80"
+_KINDS = {
+    "utf-8": _UTF8,
+    "lone": _LONE,
+    "control": b"\x01",
+    "nul": b"\x00",
+    "tab": b"\x09",
+    "cr": b"\x0d",
+    "space": b" ",
+    "del": b"\x7f",
+    "ff": b"\xff",
+}
+#: The kinds whose answer is another's: 0x7F is a `control`, 0xFF a lone `high`.
+_AS = {"del": "control", "ff": "lone"}
+
+# What the front door answers each kind with, in the path and in a query value. `encoded` is the
+# answer to the request with the byte percent-encoded, `?` the one with each byte read as a `?`.
+_GOOGLE = dict.fromkeys(("utf-8", "lone"), "encoded") | {
+    "control": "google 54",
+    "nul": "google 54",
+    "tab": "google 1555",
+    "cr": "google 1555",
+    "space": "google 1555",
+}
+_ATLASSIAN = {
+    "utf-8": "encoded",
+    "lone": "encoded",
+    "control": "edge invalid_characters",
+    "nul": "cloudfront",
+    "tab": "edge codec_error",
+    "cr": "cloudfront",
+    "space": "encoded",
+}
+_CLOUDFLARE_PATH = dict.fromkeys(("utf-8", "lone", "control", "tab"), "cloudflare empty") | {
+    "nul": "cloudflare page",
+    "cr": "cloudflare page",
+    "space": "encoded",
+}
+_CLOUDFLARE_QUERY = _CLOUDFLARE_PATH | {"space": "cloudflare empty"}
+_S3_QUERY = {
+    "utf-8": "encoded",
+    "lone": "encoded",
+    "control": "encoded",
+    "nul": "s3 empty",
+    "tab": "s3 empty",
+    "cr": "s3 empty",
+    "space": "s3 505",
+}
+_GRAPH_QUERY = dict.fromkeys(("utf-8", "lone"), "encoded") | {
+    "control": "graph invalid url",
+    "nul": "graph invalid url",
+    "tab": "graph badly formed",
+    "cr": "graph badly formed",
+    "space": "graph badly formed",
+}
+_MEASURED = {
+    # vendor: (path the byte goes under, the path's answers, the query's answers)
+    "api.github.com": (
+        "/github/",
+        dict.fromkeys(_KINDS, "github"),
+        dict.fromkeys(_KINDS, "github"),
+    ),
+    "slack.com": ("/slack/api/", dict.fromkeys(_KINDS, "slack"), dict.fromkeys(_KINDS, "slack")),
+    "www.googleapis.com": ("/drive/v3/files/", _GOOGLE, _GOOGLE),
+    "sheets.googleapis.com": ("/sheets/v4/spreadsheets/", _GOOGLE, _GOOGLE),
+    "Jira Cloud": ("/atlassian/rest/api/3/", _ATLASSIAN, _ATLASSIAN),
+    "Confluence Cloud": ("/atlassian/wiki/rest/api/", _ATLASSIAN, _ATLASSIAN),
+    "api.notion.com": ("/notion/v1/", _CLOUDFLARE_PATH, _CLOUDFLARE_QUERY),
+    "api.hubapi.com": ("/hubspot/crm/v3/objects/contacts/", _CLOUDFLARE_PATH, _CLOUDFLARE_QUERY),
+    "api.linear.app": ("/linear/", _CLOUDFLARE_PATH, _CLOUDFLARE_QUERY),
+    "api.fireflies.ai": ("/fireflies/", _CLOUDFLARE_PATH, _CLOUDFLARE_QUERY),
+    "s3.us-east-1.amazonaws.com": (
+        "/s3/no-such-bucket/",
+        _S3_QUERY | {"utf-8": "?", "lone": "?", "nul": "s3 empty"},
+        _S3_QUERY,
+    ),
+    "graph.microsoft.com": ("/msgraph/v1.0/", _GRAPH_QUERY | {"lone": "graph empty"}, _GRAPH_QUERY),
+}
+
+# Two raw bytes in one target, both orders where the order decides: (base, target after it,
+# answer), each as measured on the first host of the family above.
+_PAIRS = [
+    ("/drive/v3/files/", b"nope\x09y\x01x", "google 54"),
+    ("/drive/v3/files/", b"nope?b=\x01y\x20x", "google 54"),
+    ("/drive/v3/files/", b"nope\x80x?b=\x20x", "google 1555"),
+    ("/atlassian/rest/api/3/", b"nope\x01y\x00x", "cloudfront"),
+    ("/atlassian/rest/api/3/", b"nope\x01y\x20x", "encoded"),
+    ("/atlassian/rest/api/3/", b"nope\x20y\x09x", "encoded"),
+    ("/atlassian/rest/api/3/", b"nope x?b=\x01x", "edge invalid_characters"),
+    ("/atlassian/rest/api/3/", b"nope\x09x?b= x", "encoded"),
+    ("/atlassian/rest/api/3/", b"nope?b=\x09y\x01x", "edge invalid_characters"),
+    ("/atlassian/rest/api/3/", b"nope?b=\x01y\x20x", "edge invalid_characters"),
+    ("/notion/v1/", b"nope\x01y\x20x", "encoded"),
+    ("/notion/v1/", b"nope x?b=\x80x", "cloudflare empty"),
+    ("/notion/v1/", b"nope\x01x?b= x", "cloudflare empty"),
+    ("/notion/v1/", b"nope\x80y\x0dx", "cloudflare page"),
+    ("/s3/no-such-bucket/", b"nope\x0dy x", "s3 empty"),
+    ("/s3/no-such-bucket/", b"nope\x09y x", "s3 505"),
+    ("/s3/no-such-bucket/", b"nope y\x09x", "s3 505"),
+    ("/msgraph/v1.0/", b"nope\x01y\x09x", "graph invalid url"),
+    ("/msgraph/v1.0/", b"nope\x09y\x01x", "graph badly formed"),
+    ("/msgraph/v1.0/", b"nope\x80x?b=\x01x", "graph invalid url"),
+    ("/github", b"?b=\x80x", "github"),
+    ("/s3/", b"no-such-bucket\xc3\xa9x/nope", "?"),
+    ("/s3/", b"no-such-bucket\xc3\xa9\x01x/nope", "?"),
+    ("/s3/", b"no-such-bucket\x01\xc3\xa9x/nope", "encoded"),
+]
+
+
+def _rows():
+    for host, (base, path, query) in _MEASURED.items():
+        for kind, sent in _KINDS.items():
+            answer = _AS.get(kind, kind)
+            yield pytest.param(base, b"nope" + sent + b"x", path[answer], id=f"{host} path {kind}")
+            yield pytest.param(base, b"nope?b=" + sent + b"x", query[answer], id=f"{host} {kind}")
+    for base, rest, answer in _PAIRS:
+        yield pytest.param(base, rest, answer, id=f"{base} {rest!r}")
+    yield pytest.param("/_meta/", b"nope\x80x", "uvicorn", id="a path no vendor owns")
+
+
+def _exchange(base_url: str, request: bytes) -> tuple[int, dict[str, str], bytes]:
+    url = urllib.parse.urlsplit(base_url)
+    with socket.create_connection((url.hostname, url.port), timeout=10) as c:
+        c.sendall(request)
+        answer = b""
+        while chunk := c.recv(65536):
+            answer += chunk
+    head, _, body = answer.partition(b"\r\n\r\n")
+    status_line, *lines = head.decode("latin-1").split("\r\n")
+    headers = {k.strip().lower(): v.strip() for k, v in (line.split(":", 1) for line in lines)}
+    return int(status_line.split()[1]), headers, body
+
+
+def _get(base_url: str, target: bytes, admin: str | None) -> tuple[int, dict[str, str], bytes]:
+    credential = b"Authorization: Bearer %s\r\n" % admin.encode() if admin else b""
+    request = b"GET %s HTTP/1.1\r\nHost: x\r\n%sConnection: close\r\n\r\n" % (target, credential)
+    return _exchange(base_url, request)
+
+
+def _encoded(target: bytes, question_marks: bool = False) -> bytes:
+    path, mark, query = target.partition(b"?")
+    if question_marks:
+        path = re.sub(rb"[\x80-\xff]", b"%3F", path)
+    raw = re.compile(rb"[\x00-\x20\x7f-\xff]")
+    path, query = (raw.sub(lambda m: b"%%%02X" % m[0][0], part) for part in (path, query))
+    return path + mark + query
+
+
+def _ids_left_out(base: str, body: bytes) -> object:
+    """What two answers to one request share: S3's error and Graph's carry ids seeded from the
+    request or drawn at random."""
+    if base.startswith("/s3/"):
+        return re.findall(rb"<(Code|BucketName|Key)>(.*?)</", body)
+    if base.startswith("/msgraph/"):
+        return re.findall(rb'"code":"(.*?)"', body)
+    return body
+
+
+def _page(answer: str, target: bytes) -> tuple[int, str | None, bytes]:
+    if answer == "cloudfront":
+        raw_path = _encoded(target).partition(b"?")[0].decode("latin-1")
+        return 400, "text/html", errors.atlassian.cdn_bad_request("GET", raw_path).encode()
+    if answer.startswith("edge "):
+        return 400, "text/html", errors.atlassian.edge_page(f"http1.{answer[5:]}").encode()
+    return {
+        "github": (400, "text/html; charset=utf-8", request_target.GITHUB_PAGE.encode()),
+        "slack": (400, "text/plain", b"Bad Request"),
+        "google 54": (400, "text/html; charset=UTF-8", request_target.GOOGLE_PAGE_54),
+        "google 1555": (400, "text/html; charset=UTF-8", request_target.GOOGLE_PAGE_1555),
+        "cloudflare page": (400, "text/html", request_target.CLOUDFLARE_PAGE),
+        "cloudflare empty": (400, None, b""),
+        "s3 empty": (400, None, b""),
+        "graph empty": (400, None, b""),
+        "graph invalid url": (400, "text/html; charset=us-ascii", request_target.GRAPH_INVALID_URL),
+        "graph badly formed": (
+            400,
+            "text/html; charset=us-ascii",
+            request_target.GRAPH_BADLY_FORMED,
+        ),
+        "uvicorn": (400, "text/plain; charset=utf-8", b"Invalid HTTP request received."),
+    }[answer]
+
+
+@pytest.mark.parametrize("base, rest, answer", list(_rows()))
+def test_a_raw_byte_in_the_target_is_answered_as_the_vendors_front_door_answers_it(
+    live_server, base, rest, answer
+):
+    base_url, settings = live_server
+    admin = None if base.startswith("/s3/") else settings.admin_token
+    target = base.encode() + rest
+    status, headers, body = _get(base_url, target, admin)
+    if answer in ("encoded", "?"):
+        twin = _get(base_url, _encoded(target, question_marks=answer == "?"), admin)
+        assert status == twin[0]
+        assert _ids_left_out(base, body) == _ids_left_out(base, twin[2])
+        return
+    if answer == "s3 505":
+        assert (status, headers["content-type"]) == (505, "application/xml")
+        assert b"<Code>HttpVersionNotSupported</Code>" in body
+        return
+    want_status, want_type, want_body = _page(answer, target)
+    assert (status, headers.get("content-type"), body) == (want_status, want_type, want_body)
+
+
+@pytest.mark.parametrize(
+    "line, encoded, sent",
+    [
+        (b"GET /a\x80b HTTP/1.1\r\n", b"GET /a%80b HTTP/1.1\r\n", b"/a\x80b"),
+        (b"GET /a\x80b HTTP/1.1\n", b"GET /a%80b HTTP/1.1\n", b"/a\x80b"),
+        (b"GET /a b?c d HTTP/1.1\r\n", b"GET /a%20b?c%20d HTTP/1.1\r\n", b"/a b?c d"),
+        (b"GET /a\rb HTTP/1.1\r\n", b"GET /a%0Db HTTP/1.1\r\n", b"/a\rb"),
+        (b"GET /a%20b HTTP/1.1\r\n", b"GET /a%20b HTTP/1.1\r\n", None),
+        (b"GET /a\x80b\r\n", b"GET /a\x80b\r\n", None),
+        (b"GET /a\x80b HTTQ/1.1\r\n", b"GET /a\x80b HTTQ/1.1\r\n", None),
+        (b" /a\x80b HTTP/1.1\r\n", b" /a\x80b HTTP/1.1\r\n", None),
+    ],
+)
+def test_the_target_is_what_lies_between_the_first_space_and_the_last(line, encoded, sent):
+    assert request_target.encode_line(line) == (encoded, sent)
+
+
+def test_a_raw_byte_is_read_in_a_request_after_another_on_one_connection(live_server):
+    base_url, settings = live_server
+    url = urllib.parse.urlsplit(base_url)
+    auth = b"Authorization: Bearer %s\r\n" % settings.admin_token.encode()
+    with socket.create_connection((url.hostname, url.port), timeout=10) as c:
+        reader = c.makefile("rb")
+        answers = []
+        for first, second in (
+            (b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n", b""),
+            (b"GET /github/no", b"pe\x80x HTTP/1.1\r\nHost: x\r\n" + auth + b"\r\n"),
+            (b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", b""),
+        ):
+            c.sendall(first)
+            if second:
+                time.sleep(0.2)
+                c.sendall(second)
+            status = int(reader.readline().split()[1])
+            length = 0
+            while (line := reader.readline()) not in (b"\r\n", b""):
+                name, _, value = line.partition(b":")
+                if name.strip().lower() == b"content-length":
+                    length = int(value)
+            answers.append((status, reader.read(length)))
+    assert [status for status, _ in answers] == [200, 400, 200]
+    assert answers[1][1] == request_target.GITHUB_PAGE.encode()
+
+
+def test_a_body_in_a_read_of_its_own_reaches_the_route(live_server):
+    """A read that starts no request is the parser's as it came: a body with no LF in it, sent after
+    its headers, is answered."""
+    base_url, settings = live_server
+    url = urllib.parse.urlsplit(base_url)
+    form = b"token=" + settings.admin_token.encode()
+    head = (
+        b"POST /slack/api/auth.test HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+        b"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n" % len(form)
+    )
+    with socket.create_connection((url.hostname, url.port), timeout=10) as c:
+        c.sendall(head)
+        time.sleep(0.2)
+        c.sendall(form)
+        answer = b""
+        while chunk := c.recv(65536):
+            answer += chunk
+    assert answer.startswith(b"HTTP/1.1 200 ")
+    assert b'"ok":true' in answer

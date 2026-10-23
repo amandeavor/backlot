@@ -27,7 +27,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, DispatchFunction
 from starlette.routing import BaseRoute, Match
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from backlot import auth, errors, openapi, overlay, store, synth, telemetry
+from backlot import auth, errors, openapi, overlay, request_target, store, synth, telemetry
 from backlot.acl import Acl
 from backlot.config import get_settings
 from backlot.errors import msgraph as msgraph_errors
@@ -1188,15 +1188,6 @@ async def warn_slack_post_charset(request: Request, call_next):
     )
 
 
-#: The page Cloudflare, in front of Linear and Fireflies, answers a request carrying `Authorization`
-#: more than once with: `text/html` with no charset, CRLF line ends, 155 bytes.
-_CLOUDFLARE_REPEATED_AUTHORIZATION = (
-    "<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n"
-    "<center><h1>400 Bad Request</h1></center>\r\n<hr><center>cloudflare</center>\r\n"
-    "</body>\r\n</html>\r\n"
-)
-
-
 @_middleware(
     lambda scope: (
         _at_or_under(_url_path(scope), ("/linear", "/fireflies"))
@@ -1205,14 +1196,14 @@ _CLOUDFLARE_REPEATED_AUTHORIZATION = (
 )
 async def refuse_a_repeated_authorization_on_linear_and_fireflies(request: Request, call_next):
     """Answer a `/linear` or `/fireflies` request that carries `Authorization` more than once with
-    :data:`_CLOUDFLARE_REPEATED_AUTHORIZATION`'s 400, ahead of the route, the body and the
+    :data:`backlot.request_target.CLOUDFLARE_PAGE`'s 400, ahead of the route, the body and the
     credential. api.linear.app and api.fireflies.ai answered it on 2026-10-19 (UTC) to two copies of
     a key, a key and `nope` in either order, a key and an empty value, two empty values, three
     copies and a second header named in lower case; on `POST /graphql` with a query, with no bytes,
     with `{` and with a body past each vendor's size limit, on `GET /graphql`, on `HEAD /graphql`,
     which declared the 155 bytes and sent none, and on `POST /nosuch` and `POST /`."""
     return Response(
-        _CLOUDFLARE_REPEATED_AUTHORIZATION.encode(),
+        request_target.CLOUDFLARE_PAGE,
         status_code=400,
         headers={"Content-Type": "text/html"},
     )
@@ -1231,6 +1222,19 @@ async def put_a_request_id_on_github_answers(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault(github.REQUEST_ID_HEADER, rid)
     return response
+
+
+@_middleware(lambda scope: request_target.SENT in scope)
+async def answer_a_raw_byte_in_the_request_target(request: Request, call_next):
+    """Answer a request whose target held a raw byte ``backlot.protocol`` percent-encoded as the
+    vendor's front door answers it (``backlot.request_target.answer``), or hand it on as the request
+    with the byte encoded where the front door reads it that way.
+
+    Registered after every vendor's middleware but the JSON media type's, so it answers ahead of
+    each of them, as a front door answers ahead of the API behind it.
+    """
+    answer = request_target.answer(request.scope)
+    return answer if answer is not None else await call_next(request)
 
 
 @_middleware(lambda scope: errors.has_json_media_type(_url_path(scope)))

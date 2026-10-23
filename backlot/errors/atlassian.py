@@ -2474,6 +2474,11 @@ def _cloudfront(status: int, reason: str, method: str, raw_path: str) -> str:
     return _CLOUDFRONT_PAGE.format(status=status, reason=reason, request_id=request_id)
 
 
+def cdn_bad_request(method: str, raw_path: str) -> str:
+    """The CDN's 400 page, which :func:`front_door` answers a `%00` in the path with."""
+    return _cloudfront(400, CDN_BAD_REQUEST, method, raw_path)
+
+
 #: What the edge answers a `;` in a path with, JSON or a page as `Accept` picks
 #: (:func:`front_door`). The JSON is this body, 28 bytes with its newline, on `application/json`;
 #: real's page is 18,943 bytes on `text/html` with no charset,
@@ -2488,6 +2493,12 @@ _EDGE_PAGE_400 = (
     '<!DOCTYPE html><html><head><meta name="details" content="lua_response">'
     "<title>400</title></head><body><p>400</p></body></html>"
 )
+
+
+def edge_page(details: str) -> str:
+    """:data:`_EDGE_PAGE_400` naming ``details`` in its tag, the part of the edge's 400 page that
+    tells one of its refusals from another (``backlot.request_target`` answers two more of them)."""
+    return _EDGE_PAGE_400.replace('content="lua_response"', f'content="{details}"')
 
 
 def front_door(
