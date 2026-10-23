@@ -353,6 +353,8 @@ def serve(
         _stop_at_stdin_eof()
     import uvicorn
 
+    from backlot.protocol import Protocol
+
     # The app is passed as an import STRING because that is what --reload requires.
     uvicorn.run(
         "backlot.main:app",
@@ -364,8 +366,9 @@ def serve(
         log_level=log_level.value if log_level else None,
         proxy_headers=proxy_headers,
         forwarded_allow_ips=forwarded_allow_ips,
-        # as an import string, which --reload hands to the process it starts
-        http="backlot.protocol:Protocol",
+        # the class, not its import string, which uvicorn resolves only from 0.36 on; --reload
+        # pickles it by reference
+        http=Protocol,
     )
 
 

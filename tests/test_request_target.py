@@ -123,7 +123,12 @@ _PAIRS = [
     ("/github", b"?b=\x80x", "github"),
     ("/s3/", b"no-such-bucket\xc3\xa9x/nope", "?"),
     ("/s3/", b"no-such-bucket\xc3\xa9\x01x/nope", "?"),
-    ("/s3/", b"no-such-bucket\x01\xc3\xa9x/nope", "encoded"),
+    ("/s3/", b"no-such-bucket\x01\xc3\xa9x/nope", "?"),
+    ("/s3/", b"no-such-bucket\x01\x80x/nope", "?"),
+    # the CDN's own refusals ahead of the edge's, as Backlot answers them encoded
+    ("/atlassian/rest/api/3/", b"nope%00x\x01y", "encoded"),
+    ("/atlassian/rest/api/3/", b"nope%G1x\ty", "encoded"),
+    ("/atlassian/rest/api/3/", b"a/../nope\x01y", "encoded"),
 ]
 
 
@@ -131,11 +136,15 @@ def _rows():
     for host, (base, path, query) in _MEASURED.items():
         for kind, sent in _KINDS.items():
             answer = _AS.get(kind, kind)
-            yield pytest.param(base, b"nope" + sent + b"x", path[answer], id=f"{host} path {kind}")
-            yield pytest.param(base, b"nope?b=" + sent + b"x", query[answer], id=f"{host} {kind}")
+            ids = (f"{host} path {kind}", f"{host} {kind}")
+            yield pytest.param(base, b"nope" + sent + b"x", path[answer], 1, id=ids[0])
+            yield pytest.param(base, b"nope?b=" + sent + b"x", query[answer], 1, id=ids[1])
     for base, rest, answer in _PAIRS:
-        yield pytest.param(base, rest, answer, id=f"{base} {rest!r}")
-    yield pytest.param("/_meta/", b"nope\x80x", "uvicorn", id="a path no vendor owns")
+        yield pytest.param(base, rest, answer, 1, id=f"{base} {rest!r}")
+    # `Authorization` twice, which Cloudflare refuses ahead of the bytes on these two
+    yield pytest.param("/linear/", b"nope\tx", "cloudflare page", 2, id="linear twice")
+    yield pytest.param("/fireflies/", b"nope\x01x", "cloudflare page", 2, id="fireflies twice")
+    yield pytest.param("/_meta/", b"nope\x80x", "uvicorn", 1, id="a path no vendor owns")
 
 
 def _exchange(base_url: str, request: bytes) -> tuple[int, dict[str, str], bytes]:
@@ -151,8 +160,10 @@ def _exchange(base_url: str, request: bytes) -> tuple[int, dict[str, str], bytes
     return int(status_line.split()[1]), headers, body
 
 
-def _get(base_url: str, target: bytes, admin: str | None) -> tuple[int, dict[str, str], bytes]:
-    credential = b"Authorization: Bearer %s\r\n" % admin.encode() if admin else b""
+def _get(
+    base_url: str, target: bytes, admin: str | None, times: int = 1
+) -> tuple[int, dict[str, str], bytes]:
+    credential = b"Authorization: Bearer %s\r\n" % admin.encode() * times if admin else b""
     request = b"GET %s HTTP/1.1\r\nHost: x\r\n%sConnection: close\r\n\r\n" % (target, credential)
     return _exchange(base_url, request)
 
@@ -201,14 +212,14 @@ def _page(answer: str, target: bytes) -> tuple[int, str | None, bytes]:
     }[answer]
 
 
-@pytest.mark.parametrize("base, rest, answer", list(_rows()))
+@pytest.mark.parametrize("base, rest, answer, authorizations", list(_rows()))
 def test_a_raw_byte_in_the_target_is_answered_as_the_vendors_front_door_answers_it(
-    live_server, base, rest, answer
+    live_server, base, rest, answer, authorizations
 ):
     base_url, settings = live_server
     admin = None if base.startswith("/s3/") else settings.admin_token
     target = base.encode() + rest
-    status, headers, body = _get(base_url, target, admin)
+    status, headers, body = _get(base_url, target, admin, authorizations)
     if answer in ("encoded", "?"):
         twin = _get(base_url, _encoded(target, question_marks=answer == "?"), admin)
         assert status == twin[0]

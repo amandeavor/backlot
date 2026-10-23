@@ -388,7 +388,9 @@ def test_serve_passes_its_arguments_through_to_uvicorn(monkeypatch, a_data_dir_w
     argv = ["serve", "--host", "0.0.0.0", "--port", "9999", "--log-level", "warning"]
     assert cli.main(argv) == 0
     assert seen["app"] == "backlot.main:app"  # an import STRING, which --reload requires
-    assert seen["http"] == "backlot.protocol:Protocol"
+    from backlot.protocol import Protocol
+
+    assert seen["http"] is Protocol
     assert (seen["host"], seen["port"], seen["log_level"]) == ("0.0.0.0", 9999, "warning")
 
 

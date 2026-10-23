@@ -30,7 +30,7 @@ import urllib.parse
 from fastapi import Request, Response
 from starlette.types import Scope
 
-from backlot import errors
+from backlot import auth, errors
 from backlot.routers import atlassian, s3
 
 #: The scope key :mod:`backlot.protocol` leaves the request target on, as sent, where it
@@ -181,12 +181,15 @@ def _google(path_kinds: list[str], query_kinds: list[str]) -> Response | None:
     return None
 
 
-def _cloudflare(path_kinds: list[str], query_kinds: list[str]) -> Response | None:
-    """:data:`CLOUDFLARE_PAGE` where a `nul` or a `cr` is anywhere; then an empty 400 with no
-    `Content-Type` for any raw byte in the query, and for one in a path that holds no `space`; and a
-    path with a `space` in it read as its percent-encoding, whatever else the path holds."""
+def _cloudflare(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Response | None:
+    """:data:`CLOUDFLARE_PAGE` where a `nul` or a `cr` is anywhere, and on Linear and Fireflies
+    where `Authorization` comes more than once (``auth.repeated_authorization``); then an empty 400
+    with no `Content-Type` for any raw byte in the query, and for one in a path that holds no
+    `space`; and a path with a `space` in it read as its percent-encoding, whatever else the path
+    holds."""
     every = set(path_kinds) | set(query_kinds)
-    if every & {"nul", "cr"}:
+    graphql = _under(scope["path"], "/linear") or _under(scope["path"], "/fireflies")
+    if every & {"nul", "cr"} or (graphql and auth.repeated_authorization(Request(scope))):
         return _page(CLOUDFLARE_PAGE, "text/html")
     if query_kinds or "space" not in path_kinds:
         return _page(b"", None)
@@ -194,18 +197,23 @@ def _cloudflare(path_kinds: list[str], query_kinds: list[str]) -> Response | Non
 
 
 def _atlassian(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Response | None:
-    """CloudFront's 400 page where a `nul` or a `cr` is anywhere, ahead of the edge. The edge reads
-    the query's bytes and, where the target holds no `space` at all, the path's: a `control` is its
-    page naming `http1.invalid_characters`, and a `tab` with none, the one naming
+    """CloudFront's 400 page where a `nul` or a `cr` is anywhere, ahead of the edge, and the CDN's
+    own refusal where ``errors.atlassian.front_door`` gives one of the CDN's or its firewall's for
+    the target encoded, which ``backlot.main.answer_at_the_atlassian_front_door`` answers. The edge
+    reads the query's bytes and, where the target holds no `space` at all, the path's: a `control`
+    is its page naming `http1.invalid_characters`, and a `tab` with none, the one naming
     `http1.codec_error`. A `space`, a `high` and a path the edge does not read are read as their
     percent-encoding. Real's edge pages are 18,946 and 18,939 bytes on `text/html` with no charset,
     and the two here are :func:`backlot.errors.atlassian.edge_page`'s."""
     every = set(path_kinds) | set(query_kinds)
+    raw_path = scope["raw_path"].decode("latin-1")
     if every & {"nul", "cr"}:
-        page = errors.atlassian.cdn_bad_request(
-            scope["method"], scope["raw_path"].decode("latin-1")
-        )
+        page = errors.atlassian.cdn_bad_request(scope["method"], raw_path)
         return _front_door(scope, "cdn", page, {})
+    query = scope["query_string"].decode("latin-1")
+    door = errors.atlassian.front_door(scope["method"], raw_path, query)
+    if door is not None and (door.layer == "cdn" or errors.atlassian.waf_blocks(raw_path, query)):
+        return None
     read = list(query_kinds) if "space" in every else path_kinds + query_kinds
     for kind, details in (("control", "http1.invalid_characters"), ("tab", "http1.codec_error")):
         if kind in read:
@@ -226,10 +234,10 @@ def _front_door(scope: Scope, layer: str, page: str, headers: dict[str, str]) ->
 def _s3(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Response | None:
     """An empty 400 where a `nul` or a `cr` is anywhere, then real's 505 where a `space` is, then an
     empty 400 again where a `tab` is. A `control` is read as its percent-encoding, and so is a
-    `high` in the query, and in a path whose first raw byte is a `control`; in a path whose first
-    raw byte is a `high`, each `high` is read as `?`. So real's 400 `InvalidBucketName` named a
-    bucket name sent with them: `C3 A9` raw came back `??`, `C3 A9 01` as `??&#1;` and `01 C3 A9`
-    as `&#1;é`."""
+    `high` in the query; each `high` in the path is read as `?`, as most of real's front ends read
+    one. Real's 400 `InvalidBucketName` named a bucket name sent with them, twenty times each on
+    2026-10-23: `80` as `?` every time, `C3 A9` as `??` 17 times and `é` 3, `01 C3 A9` as `&#1;??`
+    18 times and `&#1;é` 2."""
     every = set(path_kinds) | set(query_kinds)
     if every & {"nul", "cr"}:
         return _page(b"", None)
@@ -245,7 +253,7 @@ def _s3(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Response
         return _page(body.encode(), "application/xml", status=505)
     if "tab" in every:
         return _page(b"", None)
-    if path_kinds[:1] == ["high"]:
+    if "high" in path_kinds:
         sent_path = scope[SENT].partition(b"?")[0]
         raw_path = _RAW.sub(lambda m: b"%3F" if m[0][0] >= 0x80 else b"%%%02X" % m[0][0], sent_path)
         scope["raw_path"] = raw_path
@@ -287,7 +295,7 @@ def answer(scope: Scope) -> Response | None:
     if errors.atlassian.owns(path):
         return _atlassian(scope, in_path, in_query)
     if any(_under(path, p) for p in ("/notion", "/hubspot", "/linear", "/fireflies")):
-        return _cloudflare(in_path, in_query)
+        return _cloudflare(scope, in_path, in_query)
     if errors.s3.owns(path):
         return _s3(scope, in_path, in_query)
     if _under(path, "/msgraph"):
