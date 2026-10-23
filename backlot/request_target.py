@@ -195,22 +195,24 @@ def _cloudflare(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> 
 
 
 def _atlassian(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Response | None:
-    """CloudFront's 400 page where a `nul` or a `cr` is anywhere, ahead of the edge, and the CDN's
-    own refusal where ``errors.atlassian.front_door`` gives one of the CDN's or its firewall's for
-    the target encoded, which ``backlot.main.answer_at_the_atlassian_front_door`` answers. The edge
-    reads the query's bytes and, where the target holds no `space` at all, the path's: a `control`
-    is its page naming `http1.invalid_characters`, and a `tab` where no `control` is, the one naming
+    """CloudFront's 400 page where a `nul` or a `cr` is anywhere, ahead of the edge; then, where
+    ``errors.atlassian.cdn_refusal`` gives one for the target encoded, the CDN's own page, which
+    ``backlot.main.answer_at_the_atlassian_front_door`` answers. The edge reads the query's bytes
+    and, where the target holds no `space` at all, the path's: a `control` is its page naming
+    `http1.invalid_characters`, and a `tab` where no `control` is, the one naming
     `http1.codec_error`. A `space`, a `high` and a path the edge does not read are read as their
     percent-encoding. Real's edge pages are 18,946 and 18,939 bytes on `text/html` with no charset,
-    and the two here are :func:`backlot.errors.atlassian.edge_page`'s."""
+    and the two here are :func:`backlot.errors.atlassian.edge_page`'s. The CDN's refusal of a method
+    came ahead of the edge on 2026-10-23: `PROPFIND` was its 403 beside a `control` in the path and
+    in the query, a `tab`, a `space` and a `high`, and `TRACE` its 405 beside a `control` and a
+    `tab`; beside a `nul` or a `cr`, `PROPFIND` was the 400 for those."""
     every = set(path_kinds) | set(query_kinds)
     raw_path = scope["raw_path"].decode("latin-1")
     if every & {"nul", "cr"}:
         page = errors.atlassian.cdn_bad_request(scope["method"], raw_path)
         return _front_door(scope, "cdn", page, {})
     query = scope["query_string"].decode("latin-1")
-    door = errors.atlassian.front_door(scope["method"], raw_path, query)
-    if door is not None and (door.layer == "cdn" or errors.atlassian.waf_blocks(raw_path, query)):
+    if errors.atlassian.cdn_refusal(scope["method"], raw_path, query) is not None:
         return None
     read = list(query_kinds) if "space" in every else path_kinds + query_kinds
     for kind, details in (("control", "http1.invalid_characters"), ("tab", "http1.codec_error")):

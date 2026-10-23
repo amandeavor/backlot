@@ -2,8 +2,8 @@
 
 A client library percent-encodes such a byte or refuses to send it, and the TestClient would too,
 so each request here is written to a socket by hand, to the server ``live_server`` starts with
-``backlot serve``. A single-byte row names the vendor host whose measured answer it holds; a pair
-row names its path, measured on the first host of its family (`_PAIRS`).
+``backlot serve``. A single-byte row names the vendor host whose measured answer it holds; a row
+of `_PAIRS` names its path, measured on the host that path is.
 """
 
 from __future__ import annotations
@@ -97,8 +97,8 @@ _MEASURED = {
     "graph.microsoft.com": ("/msgraph/v1.0/", _GRAPH_QUERY | {"lone": "graph empty"}, _GRAPH_QUERY),
 }
 
-# Two raw bytes in one target, both orders where the order decides: (base, target after it,
-# answer), each as measured on the first host of the family above.
+# Raw bytes beside each other or beside an escape, both orders where the order decides: (base,
+# target after it, answer), each measured on the host whose path the base is.
 _PAIRS = [
     ("/drive/v3/files/", b"nope\x09y\x01x", "google 54"),
     ("/drive/v3/files/", b"nope?b=\x01y\x20x", "google 54"),
@@ -134,21 +134,41 @@ _PAIRS = [
     ("/atlassian/wiki/rest/api/", b"nope%2Fx\x01y", "edge invalid_characters"),
 ]
 
+# A method the CDN does not pass on, whose refusal comes ahead of the edge's: (method, base,
+# target after it, answer), on Jira Cloud but the one Confluence path.
+_CDN_METHODS = [
+    (b"PROPFIND", "/atlassian/rest/api/3/", b"nope\x01y", "encoded"),
+    (b"PROPFIND", "/atlassian/rest/api/3/", b"nope?b=\x01y", "encoded"),
+    (b"PROPFIND", "/atlassian/wiki/rest/api/", b"nope?b=\x01y", "encoded"),
+    (b"PROPFIND", "/atlassian/rest/api/3/", b"nope\ty", "encoded"),
+    (b"PROPFIND", "/atlassian/rest/api/3/", b"nope y", "encoded"),
+    (b"PROPFIND", "/atlassian/rest/api/3/", b"nope\x80y", "encoded"),
+    (b"TRACE", "/atlassian/rest/api/3/", b"nope\x01y", "encoded"),
+    (b"TRACE", "/atlassian/rest/api/3/", b"nope\ty", "encoded"),
+    (b"PROPFIND", "/atlassian/rest/api/3/", b"nope\x00y", "cloudfront"),
+    (b"PROPFIND", "/atlassian/rest/api/3/", b"nope\ry", "cloudfront"),
+]
+
 
 def _rows():
     for host, (base, path, query) in _MEASURED.items():
         for kind, sent in _KINDS.items():
             answer = _AS.get(kind, kind)
             ids = (f"{host} path {kind}", f"{host} {kind}")
-            yield pytest.param(base, b"nope" + sent + b"x", path[answer], 1, id=ids[0])
-            yield pytest.param(base, b"nope?b=" + sent + b"x", query[answer], 1, id=ids[1])
+            yield pytest.param(b"GET", base, b"nope" + sent + b"x", path[answer], 1, id=ids[0])
+            yield pytest.param(b"GET", base, b"nope?b=" + sent + b"x", query[answer], 1, id=ids[1])
     for base, rest, answer in _PAIRS:
-        yield pytest.param(base, rest, answer, 1, id=f"{base} {rest!r}")
+        yield pytest.param(b"GET", base, rest, answer, 1, id=f"{base} {rest!r}")
+    for method, base, rest, answer in _CDN_METHODS:
+        yield pytest.param(method, base, rest, answer, 1, id=f"{method.decode()} {base} {rest!r}")
     # `Authorization` twice, which Cloudflare refuses ahead of the bytes
     for base, sent in (("/linear/", b"\t"), ("/fireflies/", b"\x01"), ("/notion/v1/", b"\t")):
-        yield pytest.param(base, b"nope" + sent + b"x", "cloudflare page", 2, id=f"{base} twice")
-    yield pytest.param("/hubspot/crm/v3/objects/contacts/", b"nope\tx", "cloudflare page", 2)
-    yield pytest.param("/_meta/", b"nope\x80x", "uvicorn", 1, id="a path no vendor owns")
+        rest = b"nope" + sent + b"x"
+        yield pytest.param(b"GET", base, rest, "cloudflare page", 2, id=f"{base} twice")
+    yield pytest.param(
+        b"GET", "/hubspot/crm/v3/objects/contacts/", b"nope\tx", "cloudflare page", 2
+    )
+    yield pytest.param(b"GET", "/_meta/", b"nope\x80x", "uvicorn", 1, id="a path no vendor owns")
 
 
 def _exchange(base_url: str, request: bytes) -> tuple[int, dict[str, str], bytes]:
@@ -164,11 +184,15 @@ def _exchange(base_url: str, request: bytes) -> tuple[int, dict[str, str], bytes
     return int(status_line.split()[1]), headers, body
 
 
-def _get(
-    base_url: str, target: bytes, admin: str | None, times: int = 1
+def _send(
+    base_url: str, method: bytes, target: bytes, admin: str | None, times: int = 1
 ) -> tuple[int, dict[str, str], bytes]:
     credential = b"Authorization: Bearer %s\r\n" % admin.encode() * times if admin else b""
-    request = b"GET %s HTTP/1.1\r\nHost: x\r\n%sConnection: close\r\n\r\n" % (target, credential)
+    request = b"%s %s HTTP/1.1\r\nHost: x\r\n%sConnection: close\r\n\r\n" % (
+        method,
+        target,
+        credential,
+    )
     return _exchange(base_url, request)
 
 
@@ -191,10 +215,11 @@ def _ids_left_out(base: str, body: bytes) -> object:
     return body
 
 
-def _page(answer: str, target: bytes) -> tuple[int, str | None, bytes]:
+def _page(answer: str, method: bytes, target: bytes) -> tuple[int, str | None, bytes]:
     if answer == "cloudfront":
         raw_path = _encoded(target).partition(b"?")[0].decode("latin-1")
-        return 400, "text/html", errors.atlassian.cdn_bad_request("GET", raw_path).encode()
+        page = errors.atlassian.cdn_bad_request(method.decode(), raw_path)
+        return 400, "text/html", page.encode()
     if answer.startswith("edge "):
         return 400, "text/html", errors.atlassian.edge_page(f"http1.{answer[5:]}").encode()
     return {
@@ -216,16 +241,16 @@ def _page(answer: str, target: bytes) -> tuple[int, str | None, bytes]:
     }[answer]
 
 
-@pytest.mark.parametrize("base, rest, answer, authorizations", list(_rows()))
+@pytest.mark.parametrize("method, base, rest, answer, authorizations", list(_rows()))
 def test_a_raw_byte_in_the_target_is_answered_as_the_vendors_front_door_answers_it(
-    live_server, base, rest, answer, authorizations
+    live_server, method, base, rest, answer, authorizations
 ):
     base_url, settings = live_server
     admin = None if base.startswith("/s3/") else settings.admin_token
     target = base.encode() + rest
-    status, headers, body = _get(base_url, target, admin, authorizations)
+    status, headers, body = _send(base_url, method, target, admin, authorizations)
     if answer in ("encoded", "?"):
-        twin = _get(base_url, _encoded(target, question_marks=answer == "?"), admin)
+        twin = _send(base_url, method, _encoded(target, question_marks=answer == "?"), admin)
         assert status == twin[0]
         assert _ids_left_out(base, body) == _ids_left_out(base, twin[2])
         return
@@ -233,7 +258,7 @@ def test_a_raw_byte_in_the_target_is_answered_as_the_vendors_front_door_answers_
         assert (status, headers["content-type"]) == (505, "application/xml")
         assert b"<Code>HttpVersionNotSupported</Code>" in body
         return
-    want_status, want_type, want_body = _page(answer, target)
+    want_status, want_type, want_body = _page(answer, method, target)
     assert (status, headers.get("content-type"), body) == (want_status, want_type, want_body)
     # the edge's page carries the edge's two headers beside its own, CloudFront's neither
     edge = {"x-content-type-options": "nosniff", "x-xss-protection": "1; mode=block"}

@@ -2501,6 +2501,28 @@ def edge_page(details: str) -> str:
     return _EDGE_PAGE_400.replace('content="lua_response"', f'content="{details}"')
 
 
+def cdn_refusal(method: str, raw_path: str, raw_query: str) -> FrontDoor | None:
+    """The CDN's own page for the first three of :func:`front_door`'s checks: `%00` or a broken
+    escape in the path, a method it does not pass on and its firewall; or None."""
+    if "%00" in raw_path or _BROKEN_ESCAPE.search(raw_path):
+        return FrontDoor(
+            400, "cdn", "text/html", _cloudfront(400, CDN_BAD_REQUEST, method, raw_path), {}
+        )
+    if method not in SERVED_METHODS and method not in GATEWAY_REFUSED:
+        if method in CDN_405:
+            status, layer, reason = 405, "cdn", CDN_BAD_REQUEST
+        elif cdn_forbids(method):
+            status, layer, reason = 403, "cdn edge", CDN_METHOD_FORBIDDEN
+        else:
+            status, layer, reason = 400, "cdn", CDN_BAD_REQUEST
+        page = _cloudfront(status, reason, method, raw_path)
+        return FrontDoor(status, layer, "text/html", page, {})
+    if waf_blocks(raw_path, raw_query):
+        page = _cloudfront(403, CDN_BLOCKED, method, raw_path)
+        return FrontDoor(403, "cdn edge", "text/html", page, {})
+    return None
+
+
 def front_door(
     method: str, raw_path: str, raw_query: str, accept: str | None = None
 ) -> FrontDoor | None:
@@ -2535,22 +2557,9 @@ def front_door(
     Tomcat's, which is not copied. ``raw_path`` is the path as sent, prefix included, which is
     where an encoded slash and `%00` can still be told from a decoded one.
     """
-    if "%00" in raw_path or _BROKEN_ESCAPE.search(raw_path):
-        return FrontDoor(
-            400, "cdn", "text/html", _cloudfront(400, CDN_BAD_REQUEST, method, raw_path), {}
-        )
-    if method not in SERVED_METHODS and method not in GATEWAY_REFUSED:
-        if method in CDN_405:
-            status, layer, reason = 405, "cdn", CDN_BAD_REQUEST
-        elif cdn_forbids(method):
-            status, layer, reason = 403, "cdn edge", CDN_METHOD_FORBIDDEN
-        else:
-            status, layer, reason = 400, "cdn", CDN_BAD_REQUEST
-        page = _cloudfront(status, reason, method, raw_path)
-        return FrontDoor(status, layer, "text/html", page, {})
-    if waf_blocks(raw_path, raw_query):
-        page = _cloudfront(403, CDN_BLOCKED, method, raw_path)
-        return FrontDoor(403, "cdn edge", "text/html", page, {})
+    door = cdn_refusal(method, raw_path, raw_query)
+    if door is not None:
+        return door
     collapsed = re.sub(r"/{2,}", "/", raw_path)
     confluence = collapsed == WIKI or collapsed.startswith(f"{WIKI}/")
     encoded = collapsed.lower()
