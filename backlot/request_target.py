@@ -17,8 +17,8 @@ a cache-buster beside them but on Notion: each kind alone (0x80, 0xE9, 0xFF, `C3
 0x01, 0x1F, 0x7F, 0x00, 0x09, 0x0D, 0x20), each ordered pair of `C3 A9`, 0x80, 0x01, 0x00, 0x09,
 0x0D and 0x20 in the path and in the query, and eleven pairs split between the two. Every pair was
 answered as one of its two bytes alone; the rules below are which one. Jira Cloud answered one pair
-outside them: 0x09 and then 0x80 in the path was the 400 0x80 alone gets, where 0x80 and then 0x09
-was the tab's page.
+both ways: 0x09 and then 0x80 in the path was the 400 0x80 alone gets in one sweep and the tab's
+page, as the rules give, in a later one.
 """
 
 from __future__ import annotations
@@ -36,6 +36,10 @@ from backlot.routers import atlassian, s3
 #: The scope key :mod:`backlot.protocol` leaves the request target on, as sent, where it
 #: percent-encoded a byte of it.
 SENT = "raw_request_target"
+
+#: The scope key a rule sets where the front door reads the target as another request and closes
+#: the connection after answering it (:func:`_s3`).
+CLOSE = "raw_request_target_closes"
 
 _RAW = re.compile(rb"[\x00-\x20\x7f-\xff]")
 
@@ -59,7 +63,8 @@ def encode_line(line: bytes) -> tuple[bytes, bytes | None]:
 
 def _kind(byte: int) -> str:
     """`nul`, `tab`, `cr` and `space` for 0x00, 0x09, 0x0D and 0x20, `high` for 0x80 to 0xFF, and
-    `control` for the rest of :data:`_RAW`: 0x01 to 0x08, 0x0B, 0x0C, 0x0E to 0x1F and 0x7F."""
+    `control` for the rest of :data:`_RAW` a target can hold, an LF ending the line: 0x01 to 0x08,
+    0x0B, 0x0C, 0x0E to 0x1F and 0x7F."""
     return {0x00: "nul", 0x09: "tab", 0x0D: "cr", 0x20: "space"}.get(
         byte, "high" if byte >= 0x80 else "control"
     )
@@ -153,11 +158,17 @@ GRAPH_BADLY_FORMED = _GRAPH_PAGE.format(
 ).encode()
 
 
-def _page(body: bytes, media_type: str | None, status: int = 400, **headers: str) -> Response:
+def _page(
+    body: bytes, media_type: str | None, status: int = 400, close: bool = True, **headers: str
+) -> Response:
     """``body`` under exactly ``media_type``: a `text/` type passed as ``media_type`` would gain the
-    charset Starlette names on one."""
+    charset Starlette names on one. ``close`` ends the connection after it: on 2026-10-23 every
+    refusal here closed it on real but Cloudflare's empty 400 and Graph's, after which a second
+    request on the same connection was answered."""
     if media_type is not None:
         headers["Content-Type"] = media_type
+    if close:
+        headers["Connection"] = "close"
     return Response(body, status_code=status, headers=headers)
 
 
@@ -190,7 +201,7 @@ def _cloudflare(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> 
     if every & {"nul", "cr"} or auth.repeated_authorization(Request(scope)):
         return _page(CLOUDFLARE_PAGE, "text/html")
     if query_kinds or "space" not in path_kinds:
-        return _page(b"", None)
+        return _page(b"", None, close=False)
     return None
 
 
@@ -237,7 +248,10 @@ def _s3(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Response
     `high` in the query; each `high` in the path is read as `?`, as most of real's front ends read
     one. Real's 400 `InvalidBucketName` named a bucket name sent with them, twenty times each on
     2026-10-23: `80` as `?` every time, `C3 A9` as `??` 17 times and `é` 3, `01 C3 A9` as `&#1;??`
-    18 times and `&#1;é` 2."""
+    18 times and `&#1;é` 2. Where a `control` is, real closed the connection after its answer that
+    day (:data:`CLOSE`): `nope<01>x`, `nope<7F>x`, `nope<1F>x`, `nope<01 80>x` and `?b=<01>x` were
+    the 404 `NoSuchBucket` with `Connection: close`, where `nope%01x` and `nope<80>x` were the same
+    404 on a connection that answered the next request."""
     every = set(path_kinds) | set(query_kinds)
     if every & {"nul", "cr"}:
         return _page(b"", None)
@@ -253,6 +267,8 @@ def _s3(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Response
         return _page(body.encode(), "application/xml", status=505)
     if "tab" in every:
         return _page(b"", None)
+    if "control" in every:
+        scope[CLOSE] = True
     if "high" in path_kinds:
         sent_path = scope[SENT].partition(b"?")[0]
         raw_path = _RAW.sub(lambda m: b"%3F" if m[0][0] >= 0x80 else b"%%%02X" % m[0][0], sent_path)
@@ -274,7 +290,7 @@ def _graph(scope: Scope, path_kinds: list[str], query_kinds: list[str]) -> Respo
     try:
         scope[SENT].partition(b"?")[0].decode("utf-8")
     except UnicodeDecodeError:
-        return _page(b"", None)
+        return _page(b"", None, close=False)
     return None
 
 
@@ -282,7 +298,8 @@ def answer(scope: Scope) -> Response | None:
     """The answer to a request whose target :mod:`backlot.protocol` encoded, or ``None`` where the
     vendor reads the target as another request, which the scope is left holding.
 
-    A path no vendor owns gets the 400 uvicorn's own protocol answers such a target with."""
+    Any other path, `/oauth2/token` and `/_meta` among them, gets the 400 uvicorn's own protocol
+    answers such a target with."""
     path = scope["path"]
     sent_path, _, sent_query = scope[SENT].partition(b"?")
     in_path, in_query = _kinds(sent_path), _kinds(sent_query)
@@ -290,7 +307,7 @@ def answer(scope: Scope) -> Response | None:
         return _github(in_path, in_query)
     if _under(path, "/slack"):
         return _slack(in_path, in_query)
-    if errors.google.owns(path):
+    if errors.google.owns(path) or _under(path, "/batch"):
         return _google(in_path, in_query)
     if errors.atlassian.owns(path):
         return _atlassian(scope, in_path, in_query)
@@ -300,4 +317,4 @@ def answer(scope: Scope) -> Response | None:
         return _s3(scope, in_path, in_query)
     if _under(path, "/msgraph"):
         return _graph(scope, in_path, in_query)
-    return _page(b"Invalid HTTP request received.", "text/plain; charset=utf-8", Connection="close")
+    return _page(b"Invalid HTTP request received.", "text/plain; charset=utf-8")

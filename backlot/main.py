@@ -1211,7 +1211,10 @@ async def refuse_a_repeated_authorization_on_linear_and_fireflies(request: Reque
 
 @_middleware(lambda scope: _url_path(scope).startswith("/github"))
 async def put_a_request_id_on_github_answers(request: Request, call_next):
-    """Put an `x-github-request-id` on every `/github` answer, as real does on each one measured.
+    """Put an `x-github-request-id` on every `/github` answer the API gives, as real does on each
+    one measured. The front door's 400 for a raw byte in the target
+    (:func:`answer_a_raw_byte_in_the_request_target`) is outside it and carries none, as on real
+    (api.github.com, 2026-10-23).
 
     Registered after the other `/github` middlewares so it wraps them, and the refusals they answer
     early carry it too. Made before the route runs (``backlot.routers.github.request_id`` has why)
@@ -1228,13 +1231,19 @@ async def put_a_request_id_on_github_answers(request: Request, call_next):
 async def answer_a_raw_byte_in_the_request_target(request: Request, call_next):
     """Answer a request whose target held a raw byte ``backlot.protocol`` percent-encoded as the
     vendor's front door answers it (``backlot.request_target.answer``), or hand it on as the request
-    the front door reads it as.
+    the front door reads it as, closing the connection after the answer where the front door does
+    (``backlot.request_target.CLOSE``).
 
     Registered after every vendor's middleware but the JSON media type's, so it answers ahead of
     each of them, as a front door answers ahead of the API behind it.
     """
     answer = request_target.answer(request.scope)
-    return answer if answer is not None else await call_next(request)
+    if answer is not None:
+        return answer
+    response = await call_next(request)
+    if request.scope.get(request_target.CLOSE):
+        response.headers["Connection"] = "close"
+    return response
 
 
 @_middleware(lambda scope: errors.has_json_media_type(_url_path(scope)))

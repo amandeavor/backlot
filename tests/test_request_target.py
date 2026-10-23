@@ -34,7 +34,8 @@ _AS = {"del": "control", "ff": "lone"}
 
 # What the front door answers each kind with, in the path and in a query value. `encoded` is the
 # answer to the request with the byte percent-encoded, `?` the one with each high byte in the path
-# read as a `?` and the other bytes percent-encoded.
+# read as a `?` and the other bytes percent-encoded, and ` closed` after either that answer with the
+# connection closed after it.
 _GOOGLE = dict.fromkeys(("utf-8", "lone"), "encoded") | {
     "control": "google 54",
     "nul": "google 54",
@@ -60,7 +61,7 @@ _CLOUDFLARE_QUERY = _CLOUDFLARE_PATH | {"space": "cloudflare empty"}
 _S3_QUERY = {
     "utf-8": "encoded",
     "lone": "encoded",
-    "control": "encoded",
+    "control": "encoded closed",
     "nul": "s3 empty",
     "tab": "s3 empty",
     "cr": "s3 empty",
@@ -122,9 +123,10 @@ _PAIRS = [
     ("/msgraph/v1.0/", b"nope\x80x?b=\x01x", "graph invalid url"),
     ("/github", b"?b=\x80x", "github"),
     ("/s3/", b"no-such-bucket\xc3\xa9x/nope", "?"),
-    ("/s3/", b"no-such-bucket\xc3\xa9\x01x/nope", "?"),
-    ("/s3/", b"no-such-bucket\x01\xc3\xa9x/nope", "?"),
-    ("/s3/", b"no-such-bucket\x01\x80x/nope", "?"),
+    ("/s3/", b"no-such-bucket\xc3\xa9\x01x/nope", "? closed"),
+    ("/s3/", b"no-such-bucket\x01\xc3\xa9x/nope", "? closed"),
+    ("/s3/", b"no-such-bucket\x01\x80x/nope", "? closed"),
+    ("/s3/no-such-bucket/", b"nope\x01\x80x", "? closed"),
     # the CDN's own refusals ahead of the edge's, as Backlot answers them encoded
     ("/atlassian/rest/api/3/", b"nope%00x\x01y", "encoded"),
     ("/atlassian/rest/api/3/", b"nope%G1x\ty", "encoded"),
@@ -132,6 +134,14 @@ _PAIRS = [
     # and the edge's own `;` and Tomcat's escaped slash behind it
     ("/atlassian/rest/api/3/", b"nope;x\x01y", "edge invalid_characters"),
     ("/atlassian/wiki/rest/api/", b"nope%2Fx\x01y", "edge invalid_characters"),
+    # Google's batch mounts, outside its families' prefixes (www.googleapis.com, and
+    # gmail.googleapis.com for Gmail's)
+    ("/batch/drive/v3", b"\x01x", "google 54"),
+    ("/batch/drive/v3", b"?b=\x00x", "google 54"),
+    ("/batch", b"?b=\tx", "google 1555"),
+    ("/batch/gmail/v1", b"\x01x", "google 54"),
+    ("/batch/gmail/v1", b" x", "google 1555"),
+    ("/batch/drive/v3", b"x\x80", "encoded"),
 ]
 
 # A method the CDN does not pass on, whose refusal comes ahead of the edge's: (method, base,
@@ -171,28 +181,38 @@ def _rows():
     yield pytest.param(b"GET", "/_meta/", b"nope\x80x", "uvicorn", 1, id="a path no vendor owns")
 
 
+def _read(reader) -> tuple[int, dict[str, str], bytes] | None:
+    """One answer off ``reader``, by its `Content-Length` or its chunks, or ``None`` where the
+    connection closed ahead of it."""
+    if not (status_line := reader.readline()):
+        return None
+    headers = {}
+    while (line := reader.readline()) not in (b"\r\n", b""):
+        name, _, value = line.decode("latin-1").partition(":")
+        headers[name.strip().lower()] = value.strip()
+    if headers.get("transfer-encoding") == "chunked":
+        body = b""
+        while size := int(reader.readline().split(b";")[0], 16):
+            body += reader.read(size)
+            reader.readline()
+        reader.readline()
+    else:
+        body = reader.read(int(headers.get("content-length", 0)))
+    return int(status_line.split()[1]), headers, body
+
+
 def _exchange(base_url: str, request: bytes) -> tuple[int, dict[str, str], bytes]:
     url = urllib.parse.urlsplit(base_url)
     with socket.create_connection((url.hostname, url.port), timeout=10) as c:
         c.sendall(request)
-        answer = b""
-        while chunk := c.recv(65536):
-            answer += chunk
-    head, _, body = answer.partition(b"\r\n\r\n")
-    status_line, *lines = head.decode("latin-1").split("\r\n")
-    headers = {k.strip().lower(): v.strip() for k, v in (line.split(":", 1) for line in lines)}
-    return int(status_line.split()[1]), headers, body
+        return _read(c.makefile("rb"))
 
 
 def _send(
     base_url: str, method: bytes, target: bytes, admin: str | None, times: int = 1
 ) -> tuple[int, dict[str, str], bytes]:
     credential = b"Authorization: Bearer %s\r\n" % admin.encode() * times if admin else b""
-    request = b"%s %s HTTP/1.1\r\nHost: x\r\n%sConnection: close\r\n\r\n" % (
-        method,
-        target,
-        credential,
-    )
+    request = b"%s %s HTTP/1.1\r\nHost: x\r\n%s\r\n" % (method, target, credential)
     return _exchange(base_url, request)
 
 
@@ -203,6 +223,11 @@ def _encoded(target: bytes, question_marks: bool = False) -> bytes:
     raw = re.compile(rb"[\x00-\x20\x7f-\xff]")
     path, query = (raw.sub(lambda m: b"%%%02X" % m[0][0], part) for part in (path, query))
     return path + mark + query
+
+
+#: The answers after which the front door reads another request on the same connection; it closes
+#: the connection after every other one (``backlot.request_target._page``).
+_KEEPS_THE_CONNECTION = {"encoded", "?", "cloudflare empty", "graph empty"}
 
 
 def _ids_left_out(base: str, body: bytes) -> object:
@@ -249,8 +274,10 @@ def test_a_raw_byte_in_the_target_is_answered_as_the_vendors_front_door_answers_
     admin = None if base.startswith("/s3/") else settings.admin_token
     target = base.encode() + rest
     status, headers, body = _send(base_url, method, target, admin, authorizations)
-    if answer in ("encoded", "?"):
-        twin = _send(base_url, method, _encoded(target, question_marks=answer == "?"), admin)
+    assert headers.get("connection") == (None if answer in _KEEPS_THE_CONNECTION else "close")
+    reading = answer.removesuffix(" closed")
+    if reading in ("encoded", "?"):
+        twin = _send(base_url, method, _encoded(target, question_marks=reading == "?"), admin)
         assert status == twin[0]
         assert _ids_left_out(base, body) == _ids_left_out(base, twin[2])
         return
@@ -287,31 +314,48 @@ def test_the_target_is_what_lies_between_the_first_space_and_the_last(line, enco
     assert request_target.encode_line(line) == (encoded, sent)
 
 
-def test_a_raw_byte_is_read_in_a_request_after_another_on_one_connection(live_server):
+@pytest.mark.parametrize(
+    "head, rest, statuses, body",
+    [
+        # Cloudflare's empty 400, after which the connection reads the next request
+        (b"GET /notion/v1/no", b"pe\tx", [200, 400, 200], b""),
+        # GitHub's page, after which it is closed
+        (b"GET /github/no", b"pe\x80x", [200, 400], request_target.GITHUB_PAGE.encode()),
+        # S3 closes it after the answer it gives a control read as its escape
+        (b"GET /s3/no-such-bucket/no", b"pe\x01x", [200, 404], None),
+    ],
+)
+def test_a_raw_byte_is_read_in_a_request_after_another_on_one_connection(
+    live_server, head, rest, statuses, body
+):
+    """The request line arrives in two reads, after a request answered on the same connection."""
     base_url, settings = live_server
     url = urllib.parse.urlsplit(base_url)
-    auth = b"Authorization: Bearer %s\r\n" % settings.admin_token.encode()
+    auth = (
+        b"" if b"/s3/" in head else b"Authorization: Bearer %s\r\n" % settings.admin_token.encode()
+    )
     with socket.create_connection((url.hostname, url.port), timeout=10) as c:
         reader = c.makefile("rb")
         answers = []
         for first, second in (
             (b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n", b""),
-            (b"GET /github/no", b"pe\x80x HTTP/1.1\r\nHost: x\r\n" + auth + b"\r\n"),
+            (head, rest + b" HTTP/1.1\r\nHost: x\r\n" + auth + b"\r\n"),
             (b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", b""),
         ):
-            c.sendall(first)
-            if second:
-                time.sleep(0.2)
-                c.sendall(second)
-            status = int(reader.readline().split()[1])
-            length = 0
-            while (line := reader.readline()) not in (b"\r\n", b""):
-                name, _, value = line.partition(b":")
-                if name.strip().lower() == b"content-length":
-                    length = int(value)
-            answers.append((status, reader.read(length)))
-    assert [status for status, _ in answers] == [200, 400, 200]
-    assert answers[1][1] == request_target.GITHUB_PAGE.encode()
+            try:
+                c.sendall(first)
+                if second:
+                    time.sleep(0.2)
+                    c.sendall(second)
+                answer = _read(reader)
+            except OSError:  # closed after the answer before
+                break
+            if answer is None:
+                break
+            answers.append(answer)
+    assert [status for status, _, _ in answers] == statuses
+    if body is not None:
+        assert answers[1][2] == body
 
 
 def test_a_body_in_a_read_of_its_own_reaches_the_route(live_server):
