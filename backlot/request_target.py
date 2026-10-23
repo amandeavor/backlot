@@ -162,9 +162,11 @@ def _page(
     body: bytes, media_type: str | None, status: int = 400, close: bool = True, **headers: str
 ) -> Response:
     """``body`` under exactly ``media_type``: a `text/` type passed as ``media_type`` would gain the
-    charset Starlette names on one. ``close`` ends the connection after it: on 2026-10-23 every
-    refusal here closed it on real but Cloudflare's empty 400 and Graph's, after which a second
-    request on the same connection was answered."""
+    charset Starlette names on one. ``close`` ends the connection after it: on 2026-10-23 real
+    closed it after each front door's refusal here, on api.github.com, slack.com,
+    www.googleapis.com, Jira Cloud, api.notion.com, api.linear.app, S3 and Graph, but after
+    Cloudflare's empty 400 and Graph's, where a second request on the same connection was answered.
+    uvicorn closes it after its own 400 as well."""
     if media_type is not None:
         headers["Content-Type"] = media_type
     if close:

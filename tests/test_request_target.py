@@ -3,7 +3,7 @@
 A client library percent-encodes such a byte or refuses to send it, and the TestClient would too,
 so each request here is written to a socket by hand, to the server ``live_server`` starts with
 ``backlot serve``. A single-byte row names the vendor host whose measured answer it holds; a row
-of `_PAIRS` names its path, measured on the host that path is.
+of `_TARGETS` names its path, measured on the host that path is.
 """
 
 from __future__ import annotations
@@ -98,9 +98,10 @@ _MEASURED = {
     "graph.microsoft.com": ("/msgraph/v1.0/", _GRAPH_QUERY | {"lone": "graph empty"}, _GRAPH_QUERY),
 }
 
-# Raw bytes beside each other or beside an escape, both orders where the order decides: (base,
-# target after it, answer), each measured on the host whose path the base is.
-_PAIRS = [
+# Targets the table above does not hold: raw bytes beside each other or beside an escape, both
+# orders where the order decides, and paths outside a family's prefixes: (base, target after it,
+# answer), each measured on the host whose path the base is.
+_TARGETS = [
     ("/drive/v3/files/", b"nope\x09y\x01x", "google 54"),
     ("/drive/v3/files/", b"nope?b=\x01y\x20x", "google 54"),
     ("/drive/v3/files/", b"nope\x80x?b=\x20x", "google 1555"),
@@ -167,7 +168,7 @@ def _rows():
             ids = (f"{host} path {kind}", f"{host} {kind}")
             yield pytest.param(b"GET", base, b"nope" + sent + b"x", path[answer], 1, id=ids[0])
             yield pytest.param(b"GET", base, b"nope?b=" + sent + b"x", query[answer], 1, id=ids[1])
-    for base, rest, answer in _PAIRS:
+    for base, rest, answer in _TARGETS:
         yield pytest.param(b"GET", base, rest, answer, 1, id=f"{base} {rest!r}")
     for method, base, rest, answer in _CDN_METHODS:
         yield pytest.param(method, base, rest, answer, 1, id=f"{method.decode()} {base} {rest!r}")
@@ -225,8 +226,8 @@ def _encoded(target: bytes, question_marks: bool = False) -> bytes:
     return path + mark + query
 
 
-#: The answers after which the front door reads another request on the same connection; it closes
-#: the connection after every other one (``backlot.request_target._page``).
+#: The answers after which the connection reads another request; it is closed after every other one
+#: (``backlot.request_target._page``).
 _KEEPS_THE_CONNECTION = {"encoded", "?", "cloudflare empty", "graph empty"}
 
 
