@@ -21,6 +21,7 @@ import time
 import unicodedata
 from collections.abc import Callable
 from html import escape
+from html.entities import codepoint2name
 from pathlib import Path
 from urllib.parse import quote
 
@@ -1642,18 +1643,33 @@ def _jira_issue(conn, request: Request, row, expand: str = "", fields_only: bool
 # ============================== Confluence ======================================
 
 
+# HTML 4 named entities for Confluence storage bodies, minus Š and š which real
+# Confluence leaves as themselves, leaving single quote unescaped.
+_CONFLUENCE_STORAGE_ENTITIES: dict[int, str] = {
+    cp: f"&{name};"
+    for cp, name in codepoint2name.items()
+    if cp not in (0x160, 0x161)
+}
+_CONFLUENCE_RENDERED_ENTITIES: dict[int, str] = {
+    38: "&amp;",
+    60: "&lt;",
+    62: "&gt;",
+    34: "&quot;",
+}
+
+
 def _storage(content: str) -> str:
     """Confluence storage format — XHTML with a leading structured macro, as the real
     editor emits (distinct from the rendered view below)."""
     paras = [p for p in content.split("\n\n") if p.strip()] or [content]
-    return "".join(f"<p>{escape(p)}</p>" for p in paras)
+    return "".join(f"<p>{p.translate(_CONFLUENCE_STORAGE_ENTITIES)}</p>" for p in paras)
 
 
 def _view(content: str) -> str:
     """Rendered ``view`` HTML — differs from storage (wrapped, ids, no ac: macros), as the
     real API returns a rendered representation, not the storage source."""
     paras = [p for p in content.split("\n\n") if p.strip()] or [content]
-    body = "".join(f'<p class="auto-cursor-target">{escape(p)}</p>' for p in paras)
+    body = "".join(f'<p class="auto-cursor-target">{p.translate(_CONFLUENCE_RENDERED_ENTITIES)}</p>' for p in paras)
     return f'<div class="contentLayout2"><div class="columnLayout single">{body}</div></div>'
 
 
@@ -1661,7 +1677,7 @@ def _export_view(content: str) -> str:
     """Rendered ``export_view`` HTML — the real API's export-oriented rendering (same content
     as ``view``, without editor-only attributes like ``auto-cursor-target``)."""
     paras = [p for p in content.split("\n\n") if p.strip()] or [content]
-    body = "".join(f"<p>{escape(p)}</p>" for p in paras)
+    body = "".join(f"<p>{p.translate(_CONFLUENCE_RENDERED_ENTITIES)}</p>" for p in paras)
     return f'<div class="contentLayout2"><div class="columnLayout single">{body}</div></div>'
 
 

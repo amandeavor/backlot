@@ -1397,6 +1397,28 @@ def test_confluence_storage_roundtrip(client, admin_h, ro_conn):
     assert unescape(text).strip() == doc["content"].strip()
 
 
+def test_confluence_storage_and_view_entity_encoding():
+    from backlot.routers.atlassian import _export_view, _storage, _view
+
+    text = "'" + '"' + "\u00e9" + "\u2014" + "\u0160" + "\u00a0" + "\u2603"
+
+    storage_val = _storage(text)
+    assert storage_val == "<p>'&quot;&eacute;&mdash;\u0160&nbsp;\u2603</p>"
+
+    view_val = _view(text)
+    expected_inner = "'&quot;\u00e9\u2014\u0160\u00a0\u2603"
+    assert (
+        view_val
+        == f'<div class="contentLayout2"><div class="columnLayout single"><p class="auto-cursor-target">{expected_inner}</p></div></div>'
+    )
+
+    export_val = _export_view(text)
+    assert (
+        export_val
+        == f'<div class="contentLayout2"><div class="columnLayout single"><p>{expected_inner}</p></div></div>'
+    )
+
+
 def test_atlassian_errors_use_atlassian_envelope(client, admin_h):
     # atlassian-python-api's Confluence client does response.json()["message"] on any error, so
     # Backlot must shape /atlassian errors like Cloud does, not {"detail"}: each product's own two
