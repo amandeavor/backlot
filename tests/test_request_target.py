@@ -374,7 +374,6 @@ def test_a_request_line_in_two_reads_after_another_on_one_connection(
     "form, answered",
     [
         (b"token={token}", b'"ok":true'),
-        # what httptools reads as the start of a request line
         (b"GET", b'"error":"invalid_form_data"'),
     ],
 )

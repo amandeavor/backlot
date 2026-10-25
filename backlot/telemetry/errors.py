@@ -21,7 +21,7 @@ failure:
 | Class | The call failed because |
 |---|---|
 | ``unsupported`` | Backlot does not do this yet: the baseline records the operation as ``missing`` or ``refused``, or the GraphQL engine refused a filter |
-| ``internal`` | of a Backlot bug: Backlot's own failure (see below), or a 5xx other than 501 and 505 |
+| ``internal`` | of a Backlot bug: Backlot's own failure (see below), or any 5xx but 501 and 505 |
 | ``rate_limit`` | the vendor's rate limit was reached: a 429, or a 403 with ``x-ratelimit-remaining: 0`` as GitHub sends |
 | ``auth`` | the credential was missing, wrong, or not allowed: a 401 or 403, or Slack's auth errors, which it sends with a 200 |
 | ``client`` | the request was wrong: any other failure |
