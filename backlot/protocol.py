@@ -12,6 +12,7 @@ where ``backlot.main.answer_a_raw_byte_in_the_request_target`` answers it.
 
 from __future__ import annotations
 
+import httptools
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
 
 from backlot import request_target
@@ -24,6 +25,10 @@ class Protocol(HttpToolsProtocol):
     connection, and each one after a request that has been read to its end. That is every request a
     client sends after the answer to the one before; a request that rides in the same read as the
     end of the one before it goes to the parser as it came.
+
+    A read with no LF is held for the reads after it while :func:`_starts_a_request_line` holds for
+    what is held. Once it does not, the held bytes go to the parser as they came, which refuses
+    them, and uvicorn answers its 400 at once: `hello` with no LF is answered so.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -35,14 +40,15 @@ class Protocol(HttpToolsProtocol):
     def data_received(self, data: bytes) -> None:
         if self._between_requests:
             data = self._held + data
+            self._held = b""
             end = data.find(b"\n")
-            if end < 0:
+            if end >= 0:
+                line, self._sent = request_target.encode_line(data[: end + 1])
+                data = line + data[end + 1 :]
+            elif _starts_a_request_line(data):
                 self._held = data
                 self._unset_keepalive_if_required()
                 return
-            self._held = b""
-            line, self._sent = request_target.encode_line(data[: end + 1])
-            data = line + data[end + 1 :]
         super().data_received(data)
 
     def on_message_begin(self) -> None:
@@ -55,3 +61,15 @@ class Protocol(HttpToolsProtocol):
     def on_message_complete(self) -> None:
         super().on_message_complete()
         self._between_requests = True
+
+
+def _starts_a_request_line(held: bytes) -> bool:
+    """Whether httptools reads ``held`` up to its first space, that space included, as the start of
+    a request line: a method it knows, or the start of one. What comes after the space is the
+    target, whose bytes :func:`backlot.request_target.encode_line` encodes once the line ends."""
+    method, space, _ = held.partition(b" ")
+    try:
+        httptools.HttpRequestParser(None).feed_data(method + space)
+    except httptools.HttpParserError:
+        return False
+    return True

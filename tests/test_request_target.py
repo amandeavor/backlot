@@ -9,6 +9,7 @@ of `_TARGETS` names its path, measured on the host that path is.
 from __future__ import annotations
 
 import re
+import select
 import socket
 import time
 import urllib.parse
@@ -18,6 +19,7 @@ import pytest
 from backlot import errors, request_target
 
 _UTF8, _LONE = b"\xc3\xa9", b"\x80"
+_UVICORN = b"Invalid HTTP request received."
 _KINDS = {
     "utf-8": _UTF8,
     "lone": _LONE,
@@ -263,7 +265,7 @@ def _page(answer: str, method: bytes, target: bytes) -> tuple[int, str | None, b
             "text/html; charset=us-ascii",
             request_target.GRAPH_BADLY_FORMED,
         ),
-        "uvicorn": (400, "text/plain; charset=utf-8", b"Invalid HTTP request received."),
+        "uvicorn": (400, "text/plain; charset=utf-8", _UVICORN),
     }[answer]
 
 
@@ -316,20 +318,27 @@ def test_the_target_is_what_lies_between_the_first_space_and_the_last(line, enco
 
 
 @pytest.mark.parametrize(
-    "head, rest, statuses, body",
+    "head, rest, statuses, body, before_the_rest",
     [
         # Cloudflare's empty 400, after which the connection reads the next request
-        (b"GET /notion/v1/no", b"pe\tx", [200, 400, 200], b""),
+        (b"GET /notion/v1/no", b"pe\tx", [200, 400, 200], b"", False),
         # GitHub's page, after which it is closed
-        (b"GET /github/no", b"pe\x80x", [200, 400], request_target.GITHUB_PAGE),
+        (b"GET /github/no", b"pe\x80x", [200, 400], request_target.GITHUB_PAGE, False),
         # S3 closes it after the answer it gives a control read as its escape
-        (b"GET /s3/no-such-bucket/no", b"pe\x01x", [200, 404], None),
+        (b"GET /s3/no-such-bucket/no", b"pe\x01x", [200, 404], None, False),
+        # a method httptools does not know, one past its end, and none: uvicorn's 400 to the
+        # first read alone
+        (b"hello", b" /github/nope\x80x", [200, 400], _UVICORN, True),
+        (b"GETX", b" /github/nope\x80x", [200, 400], _UVICORN, True),
+        (b" GET", b" /github/nope\x80x", [200, 400], _UVICORN, True),
     ],
 )
-def test_a_raw_byte_is_read_in_a_request_after_another_on_one_connection(
-    live_server, head, rest, statuses, body
+def test_a_request_line_in_two_reads_after_another_on_one_connection(
+    live_server, head, rest, statuses, body, before_the_rest
 ):
-    """The request line arrives in two reads, after a request answered on the same connection."""
+    """The request line arrives in two reads, after a request answered on the same connection. The
+    first read waits for the second where it starts a request line, and is answered alone where it
+    does not (``backlot.protocol._starts_a_request_line``)."""
     base_url, settings = live_server
     url = urllib.parse.urlsplit(base_url)
     auth = (
@@ -337,7 +346,7 @@ def test_a_raw_byte_is_read_in_a_request_after_another_on_one_connection(
     )
     with socket.create_connection((url.hostname, url.port), timeout=10) as c:
         reader = c.makefile("rb")
-        answers = []
+        answers, early = [], []
         for first, second in (
             (b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n", b""),
             (head, rest + b" HTTP/1.1\r\nHost: x\r\n" + auth + b"\r\n"),
@@ -346,14 +355,16 @@ def test_a_raw_byte_is_read_in_a_request_after_another_on_one_connection(
             try:
                 c.sendall(first)
                 if second:
-                    time.sleep(0.2)
-                    c.sendall(second)
+                    early.append(bool(select.select([c], [], [], 1)[0]))
+                    if not early[-1]:
+                        c.sendall(second)
                 answer = _read(reader)
             except OSError:  # closed after the answer before
                 break
             if answer is None:
                 break
             answers.append(answer)
+    assert early == [before_the_rest]
     assert [status for status, _, _ in answers] == statuses
     if body is not None:
         assert answers[1][2] == body
