@@ -168,20 +168,33 @@ def _rows():
         for kind, sent in _KINDS.items():
             answer = _AS.get(kind, kind)
             ids = (f"{host} path {kind}", f"{host} {kind}")
-            yield pytest.param(b"GET", base, b"nope" + sent + b"x", path[answer], 1, id=ids[0])
-            yield pytest.param(b"GET", base, b"nope?b=" + sent + b"x", query[answer], 1, id=ids[1])
+            yield pytest.param(b"GET", base, b"nope" + sent + b"x", path[answer], 1, b"", id=ids[0])
+            yield pytest.param(
+                b"GET", base, b"nope?b=" + sent + b"x", query[answer], 1, b"", id=ids[1]
+            )
     for base, rest, answer in _TARGETS:
-        yield pytest.param(b"GET", base, rest, answer, 1, id=f"{base} {rest!r}")
+        yield pytest.param(b"GET", base, rest, answer, 1, b"", id=f"{base} {rest!r}")
     for method, base, rest, answer in _CDN_METHODS:
-        yield pytest.param(method, base, rest, answer, 1, id=f"{method.decode()} {base} {rest!r}")
+        yield pytest.param(
+            method, base, rest, answer, 1, b"", id=f"{method.decode()} {base} {rest!r}"
+        )
     # `Authorization` twice, which Cloudflare refuses ahead of the bytes
     for base, sent in (("/linear/", b"\t"), ("/fireflies/", b"\x01"), ("/notion/v1/", b"\t")):
         rest = b"nope" + sent + b"x"
-        yield pytest.param(b"GET", base, rest, "cloudflare page", 2, id=f"{base} twice")
+        yield pytest.param(b"GET", base, rest, "cloudflare page", 2, b"", id=f"{base} twice")
     yield pytest.param(
-        b"GET", "/hubspot/crm/v3/objects/contacts/", b"nope\tx", "cloudflare page", 2
+        b"GET", "/hubspot/crm/v3/objects/contacts/", b"nope\tx", "cloudflare page", 2, b""
     )
-    yield pytest.param(b"GET", "/_meta/", b"nope\x80x", "uvicorn", 1, id="a path no vendor owns")
+    yield pytest.param(
+        b"GET", "/_meta/", b"nope\x80x", "uvicorn", 1, b"", id="a path no vendor owns"
+    )
+    # a read sent as a POST naming GET, which Google's API reads behind its front door
+    override = b"X-HTTP-Method-Override: GET\r\n"
+    for sent, answer in ((b"\x01", "google 54"), (b"\t", "google 1555"), (b"\x80", "encoded")):
+        rest = b"?fields=kind&b=" + sent + b"x"
+        yield pytest.param(
+            b"POST", "/drive/v3/about", rest, answer, 1, override, id=f"override {sent!r}"
+        )
 
 
 def _read(reader) -> tuple[int, dict[str, str], bytes] | None:
@@ -212,10 +225,15 @@ def _exchange(base_url: str, request: bytes) -> tuple[int, dict[str, str], bytes
 
 
 def _send(
-    base_url: str, method: bytes, target: bytes, admin: str | None, times: int = 1
+    base_url: str,
+    method: bytes,
+    target: bytes,
+    admin: str | None,
+    times: int = 1,
+    header: bytes = b"",
 ) -> tuple[int, dict[str, str], bytes]:
     credential = b"Authorization: Bearer %s\r\n" % admin.encode() * times if admin else b""
-    request = b"%s %s HTTP/1.1\r\nHost: x\r\n%s\r\n" % (method, target, credential)
+    request = b"%s %s HTTP/1.1\r\nHost: x\r\n%s%s\r\n" % (method, target, credential, header)
     return _exchange(base_url, request)
 
 
@@ -269,18 +287,19 @@ def _page(answer: str, method: bytes, target: bytes) -> tuple[int, str | None, b
     }[answer]
 
 
-@pytest.mark.parametrize("method, base, rest, answer, authorizations", list(_rows()))
+@pytest.mark.parametrize("method, base, rest, answer, authorizations, header", list(_rows()))
 def test_a_raw_byte_in_the_target_is_answered_as_the_vendors_front_door_answers_it(
-    live_server, method, base, rest, answer, authorizations
+    live_server, method, base, rest, answer, authorizations, header
 ):
     base_url, settings = live_server
     admin = None if base.startswith("/s3/") else settings.admin_token
     target = base.encode() + rest
-    status, headers, body = _send(base_url, method, target, admin, authorizations)
+    status, headers, body = _send(base_url, method, target, admin, authorizations, header)
     assert headers.get("connection") == (None if answer in _KEEPS_THE_CONNECTION else "close")
     reading = answer.removesuffix(" closed")
     if reading in ("encoded", "?"):
-        twin = _send(base_url, method, _encoded(target, question_marks=reading == "?"), admin)
+        encoded = _encoded(target, question_marks=reading == "?")
+        twin = _send(base_url, method, encoded, admin, header=header)
         assert status == twin[0]
         assert _ids_left_out(base, body) == _ids_left_out(base, twin[2])
         return
