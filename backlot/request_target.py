@@ -82,29 +82,29 @@ def _under(path: str, prefix: str) -> bool:
 #: GitHub's answer to every kind, in the path and in the query: 400, `text/html; charset=utf-8`,
 #: 1,440 bytes.
 GITHUB_PAGE = (
-    '\r\n<html>\r\n  <head>\r\n    <meta content="origin" name="referrer">\r\n'
-    "    <title>Bad request &middot; GitHub</title>\r\n"
-    '    <meta name="viewport" content="width=device-width">\r\n'
-    '    <style type="text/css" media="screen">\r\n      body {\r\n'
-    "        background-color: #f6f8fa;\r\n        color: rgba(0, 0, 0, 0.5);\r\n"
-    "        font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif,"
-    "Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol;\r\n"
-    "        font-size: 14px;\r\n        line-height: 1.5;\r\n      }\r\n"
-    "      .c { margin: 50px auto; max-width: 600px; text-align: center; padding: 0 24px; }\r\n"
-    "      a { text-decoration: none; }\r\n      a:hover { text-decoration: underline; }\r\n"
-    "      h1 { color: #24292e; line-height: 60px; font-size: 48px; font-weight: 300; "
-    "margin: 0px; }\r\n"
-    "      p { margin: 20px 0 40px; }\r\n      #s { margin-top: 35px; }\r\n      #s a {\r\n"
-    "        color: #666666;\r\n        font-weight: 200;\r\n        font-size: 14px;\r\n"
-    "        margin: 0 10px;\r\n      }\r\n    </style>\r\n  </head>\r\n  <body>\r\n"
-    '    <div class="c">\r\n      <h1>Whoa there!</h1>\r\n'
-    "      <p>You have sent an invalid request. <br><br>\r\n"
-    "        Please do not send this request again.\r\n      </p>\r\n"
-    '      <div id="s">\r\n'
-    '        <a href="https://support.github.com">Contact Support</a> &mdash;\r\n'
-    '        <a href="https://githubstatus.com">GitHub Status</a> &mdash;\r\n'
-    '        <a href="https://twitter.com/githubstatus">@githubstatus</a>\r\n'
-    "      </div>\r\n    </div>\r\n  </body>\r\n</html>\r\n"
+    b'\r\n<html>\r\n  <head>\r\n    <meta content="origin" name="referrer">\r\n'
+    b"    <title>Bad request &middot; GitHub</title>\r\n"
+    b'    <meta name="viewport" content="width=device-width">\r\n'
+    b'    <style type="text/css" media="screen">\r\n      body {\r\n'
+    b"        background-color: #f6f8fa;\r\n        color: rgba(0, 0, 0, 0.5);\r\n"
+    b"        font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif,"
+    b"Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol;\r\n"
+    b"        font-size: 14px;\r\n        line-height: 1.5;\r\n      }\r\n"
+    b"      .c { margin: 50px auto; max-width: 600px; text-align: center; padding: 0 24px; }\r\n"
+    b"      a { text-decoration: none; }\r\n      a:hover { text-decoration: underline; }\r\n"
+    b"      h1 { color: #24292e; line-height: 60px; font-size: 48px; font-weight: 300; "
+    b"margin: 0px; }\r\n"
+    b"      p { margin: 20px 0 40px; }\r\n      #s { margin-top: 35px; }\r\n      #s a {\r\n"
+    b"        color: #666666;\r\n        font-weight: 200;\r\n        font-size: 14px;\r\n"
+    b"        margin: 0 10px;\r\n      }\r\n    </style>\r\n  </head>\r\n  <body>\r\n"
+    b'    <div class="c">\r\n      <h1>Whoa there!</h1>\r\n'
+    b"      <p>You have sent an invalid request. <br><br>\r\n"
+    b"        Please do not send this request again.\r\n      </p>\r\n"
+    b'      <div id="s">\r\n'
+    b'        <a href="https://support.github.com">Contact Support</a> &mdash;\r\n'
+    b'        <a href="https://githubstatus.com">GitHub Status</a> &mdash;\r\n'
+    b'        <a href="https://twitter.com/githubstatus">@githubstatus</a>\r\n'
+    b"      </div>\r\n    </div>\r\n  </body>\r\n</html>\r\n"
 )
 
 #: Google's two 400 pages, the same on each of its five hosts, both `text/html; charset=UTF-8`
@@ -174,11 +174,11 @@ def _page(
     return Response(body, status_code=status, headers=headers)
 
 
-def _github(path_kinds: list[str], query_kinds: list[str]) -> Response:
-    return _page(GITHUB_PAGE.encode(), "text/html; charset=utf-8")
+def _github() -> Response:
+    return _page(GITHUB_PAGE, "text/html; charset=utf-8")
 
 
-def _slack(path_kinds: list[str], query_kinds: list[str]) -> Response:
+def _slack() -> Response:
     """envoy's 400, `text/plain` with no charset, 11 bytes, for every kind in either place."""
     return _page(b"Bad Request", "text/plain")
 
@@ -306,9 +306,9 @@ def answer(scope: Scope) -> Response | None:
     sent_path, _, sent_query = scope[SENT].partition(b"?")
     in_path, in_query = _kinds(sent_path), _kinds(sent_query)
     if _under(path, "/github"):
-        return _github(in_path, in_query)
+        return _github()
     if _under(path, "/slack"):
-        return _slack(in_path, in_query)
+        return _slack()
     if errors.google.owns(path) or _under(path, "/batch"):
         return _google(in_path, in_query)
     if errors.atlassian.owns(path):

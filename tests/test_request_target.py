@@ -249,7 +249,7 @@ def _page(answer: str, method: bytes, target: bytes) -> tuple[int, str | None, b
     if answer.startswith("edge "):
         return 400, "text/html", errors.atlassian.edge_page(f"http1.{answer[5:]}").encode()
     return {
-        "github": (400, "text/html; charset=utf-8", request_target.GITHUB_PAGE.encode()),
+        "github": (400, "text/html; charset=utf-8", request_target.GITHUB_PAGE),
         "slack": (400, "text/plain", b"Bad Request"),
         "google 54": (400, "text/html; charset=UTF-8", request_target.GOOGLE_PAGE_54),
         "google 1555": (400, "text/html; charset=UTF-8", request_target.GOOGLE_PAGE_1555),
@@ -321,7 +321,7 @@ def test_the_target_is_what_lies_between_the_first_space_and_the_last(line, enco
         # Cloudflare's empty 400, after which the connection reads the next request
         (b"GET /notion/v1/no", b"pe\tx", [200, 400, 200], b""),
         # GitHub's page, after which it is closed
-        (b"GET /github/no", b"pe\x80x", [200, 400], request_target.GITHUB_PAGE.encode()),
+        (b"GET /github/no", b"pe\x80x", [200, 400], request_target.GITHUB_PAGE),
         # S3 closes it after the answer it gives a control read as its escape
         (b"GET /s3/no-such-bucket/no", b"pe\x01x", [200, 404], None),
     ],
