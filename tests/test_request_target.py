@@ -370,12 +370,20 @@ def test_a_request_line_in_two_reads_after_another_on_one_connection(
         assert answers[1][2] == body
 
 
-def test_a_body_in_a_read_of_its_own_reaches_the_route(live_server):
+@pytest.mark.parametrize(
+    "form, answered",
+    [
+        (b"token={token}", b'"ok":true'),
+        # what httptools reads as the start of a request line
+        (b"GET", b'"error":"invalid_form_data"'),
+    ],
+)
+def test_a_body_in_a_read_of_its_own_reaches_the_route(live_server, form, answered):
     """A read that starts no request is the parser's as it came: a body with no LF in it, sent after
-    its headers, is answered."""
+    its headers, is answered, one that reads as the start of a request line too."""
     base_url, settings = live_server
     url = urllib.parse.urlsplit(base_url)
-    form = b"token=" + settings.admin_token.encode()
+    form = form.replace(b"{token}", settings.admin_token.encode())
     head = (
         b"POST /slack/api/auth.test HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
         b"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n" % len(form)
@@ -388,4 +396,4 @@ def test_a_body_in_a_read_of_its_own_reaches_the_route(live_server):
         while chunk := c.recv(65536):
             answer += chunk
     assert answer.startswith(b"HTTP/1.1 200 ")
-    assert b'"ok":true' in answer
+    assert answered in answer
