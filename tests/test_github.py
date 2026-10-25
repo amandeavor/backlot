@@ -59,10 +59,8 @@ _REF_SLASH_ROWS = [
     # the protection route does not match the slash, so the branch route answers it, as on real;
     # without the slash it is the protection route's own 404
     ("branches/main/protection/", 404, "Branch not found", 404),
-    # a ref naming nothing (see :func:`backlot.main.refuse_a_missing_slash_on_github`): each
-    # route answers its own refusal for the slash,
-    # and the path without it matches no route here, which real answers 404 on all but `commits`,
-    # whose listing the baseline records as `repos/list-commits` `missing`
+    # a ref naming nothing: each route answers its own refusal for the slash, as on real. Without
+    # the slash no route matches, and `backlot.main.refuse_a_missing_slash_on_github` answers 404
     ("git/trees/", 404, "Not Found", 404),
     ("git/ref/", 404, "Not Found", 404),
     ("statuses/", 404, "Not Found", 404),
