@@ -1397,26 +1397,56 @@ def test_confluence_storage_roundtrip(client, admin_h, ro_conn):
     assert unescape(text).strip() == doc["content"].strip()
 
 
-def test_confluence_storage_and_view_entity_encoding():
-    from backlot.routers.atlassian import _export_view, _storage, _view
+_ENTITY_TEXT = "'\"\u00e9\u2014\u0160\u0161\u00a0\u2603\u2329&<>"
+_ENTITY_STORAGE = "'&quot;&eacute;&mdash;\u0160\u0161&nbsp;\u2603&lang;&amp;&lt;&gt;"
+_ENTITY_RENDERED = "'&quot;\u00e9\u2014\u0160\u0161\u00a0\u2603\u2329&amp;&lt;&gt;"
+_LAYOUT = '<div class="contentLayout2"><div class="columnLayout single">{}</div></div>'
 
-    text = "'" + '"' + "\u00e9" + "\u2014" + "\u0160" + "\u00a0" + "\u2603"
 
-    storage_val = _storage(text)
-    assert storage_val == "<p>'&quot;&eacute;&mdash;\u0160&nbsp;\u2603</p>"
-
-    view_val = _view(text)
-    expected_inner = "'&quot;\u00e9\u2014\u0160\u00a0\u2603"
-    assert (
-        view_val
-        == f'<div class="contentLayout2"><div class="columnLayout single"><p class="auto-cursor-target">{expected_inner}</p></div></div>'
+@pytest.mark.parametrize(
+    "route, representation, value",
+    [
+        ("", "storage", f"<p>{_ENTITY_STORAGE}</p>"),
+        ("", "view", _LAYOUT.format(f'<p class="auto-cursor-target">{_ENTITY_RENDERED}</p>')),
+        ("", "export_view", _LAYOUT.format(f"<p>{_ENTITY_RENDERED}</p>")),
+        ("/child/comment", "storage", f"<p>{_ENTITY_STORAGE}</p>"),
+        (
+            "/child/comment",
+            "view",
+            _LAYOUT.format(f'<p class="auto-cursor-target">{_ENTITY_RENDERED}</p>'),
+        ),
+    ],
+)
+def test_confluence_a_body_is_written_with_each_representations_entities(
+    tmp_path, route, representation, value
+):
+    """A page's body and its comment's, holding characters
+    `backlot.routers.atlassian._CONFLUENCE_STORAGE_ENTITIES` records real writing."""
+    s = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "confluence",
+                "doc_id": "entities",
+                "space": "eng",
+                "title": "P",
+                "content": _ENTITY_TEXT,
+                "author_email": "a@x.com",
+                "visibility": "public",
+                "comments": [{"content": _ENTITY_TEXT, "author_email": "b@x.com"}],
+            }
+        ],
     )
-
-    export_val = _export_view(text)
-    assert (
-        export_val
-        == f'<div class="contentLayout2"><div class="columnLayout single"><p>{expected_inner}</p></div></div>'
-    )
+    page = served_id("confluence", "entities")
+    with client_for(s, reload=True) as c:
+        r = c.get(
+            f"/atlassian/wiki/rest/api/content/{page}{route}",
+            headers={"Authorization": f"Bearer {s.admin_token}"},
+            params={"expand": f"body.{representation}"},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()["results"][0]["body"] if route else r.json()["body"]
+    assert body[representation]["value"] == value
 
 
 def test_atlassian_errors_use_atlassian_envelope(client, admin_h):

@@ -20,7 +20,6 @@ import re
 import time
 import unicodedata
 from collections.abc import Callable
-from html import escape
 from html.entities import codepoint2name
 from pathlib import Path
 from urllib.parse import quote
@@ -1643,19 +1642,17 @@ def _jira_issue(conn, request: Request, row, expand: str = "", fields_only: bool
 # ============================== Confluence ======================================
 
 
-# HTML 4 named entities for Confluence storage bodies, minus Š and š which real
-# Confluence leaves as themselves, leaving single quote unescaped.
-_CONFLUENCE_STORAGE_ENTITIES: dict[int, str] = {
-    cp: f"&{name};"
-    for cp, name in codepoint2name.items()
-    if cp not in (0x160, 0x161)
+#: How a body's characters are written: storage writes each character HTML 4 names
+#: (`codepoint2name`) as that entity but `Š` and `š`, view and export_view write only `"`, `&`, `<`
+#: and `>` as entities, and every other character measured is itself in all three, `'` among them.
+#: Measured against Confluence Cloud on pages on 2026-10-23, and with twelve of those characters on
+#: a comment and a blog post on 2026-10-25.
+_CONFLUENCE_STORAGE_ENTITIES = {
+    cp: f"&{name};" for cp, name in codepoint2name.items() if cp not in (0x160, 0x161)
 }
-_CONFLUENCE_RENDERED_ENTITIES: dict[int, str] = {
-    38: "&amp;",
-    60: "&lt;",
-    62: "&gt;",
-    34: "&quot;",
-}
+_CONFLUENCE_RENDERED_ENTITIES = str.maketrans(
+    {'"': "&quot;", "&": "&amp;", "<": "&lt;", ">": "&gt;"}
+)
 
 
 def _storage(content: str) -> str:
@@ -1669,7 +1666,10 @@ def _view(content: str) -> str:
     """Rendered ``view`` HTML — differs from storage (wrapped, ids, no ac: macros), as the
     real API returns a rendered representation, not the storage source."""
     paras = [p for p in content.split("\n\n") if p.strip()] or [content]
-    body = "".join(f'<p class="auto-cursor-target">{p.translate(_CONFLUENCE_RENDERED_ENTITIES)}</p>' for p in paras)
+    body = "".join(
+        f'<p class="auto-cursor-target">{p.translate(_CONFLUENCE_RENDERED_ENTITIES)}</p>'
+        for p in paras
+    )
     return f'<div class="contentLayout2"><div class="columnLayout single">{body}</div></div>'
 
 
