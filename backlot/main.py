@@ -27,7 +27,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, DispatchFunction
 from starlette.routing import BaseRoute, Match
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from backlot import auth, errors, openapi, overlay, store, synth, telemetry
+from backlot import auth, errors, openapi, overlay, request_target, store, synth, telemetry
 from backlot.acl import Acl
 from backlot.config import get_settings
 from backlot.errors import msgraph as msgraph_errors
@@ -340,6 +340,39 @@ def _a_github_route_serves(scope: Scope) -> bool:
     return any(route.matches(scope)[0] is Match.FULL for route in github.router.routes)
 
 
+def _would_redirect_to_the_slashed_path(scope: Scope) -> bool:
+    """Whether the router's `redirect_slashes` would answer this path with a 307 to its
+    slash-terminated spelling."""
+    if _some_github_route_matches(scope):
+        return False
+    slashed = {**scope, "path": f"{scope['path']}/"}
+    return _some_github_route_matches(slashed)
+
+
+@_middleware(
+    lambda scope: (
+        _url_path(scope).startswith("/github/")
+        and not _url_path(scope).endswith("/")
+        and _would_redirect_to_the_slashed_path(scope)
+    )
+)
+async def refuse_a_missing_slash_on_github(request: Request, call_next):
+    """A `/github` path no route matches, whose slash-terminated spelling one does, is a 404, not
+    the 307 to that spelling Starlette's router answers.
+
+    Real routes the path as sent, with no redirect: a `GET` of `.../statuses`, `.../git/ref` or
+    `.../git/trees` was the 404 a path with no route gets, and `GET .../commits` the commit listing,
+    which the baseline records as `repos/list-commits` `missing` (measured against api.github.com
+    on 2026-10-19 and 2026-10-25). Registered first, which makes it the innermost of the GitHub
+    middlewares, so its 404 leaves through them as the router's would: `GET .../commits` and
+    `POST .../git/trees` are operations real refuses a credential on first ("Bad credentials" for
+    `Bearer nope`, 2026-10-25), which ``backlot.routers.github.refuse_an_unserved_operation``
+    answers, and of the paths this answers, only those two carry the version echo and the five
+    `x-ratelimit-*` for a token (``_github_routes``).
+    """
+    return await _http_exception_handler(request, StarletteHTTPException(status_code=404))
+
+
 @_middleware(
     lambda scope: (
         scope["path"].startswith("/github/")
@@ -352,10 +385,10 @@ async def refuse_an_unserved_github_operation(request: Request, call_next):
     refused as a served route refuses before it runs, ahead of the router's 404 or 405
     (``backlot.routers.github.refuse_an_unserved_operation``).
 
-    Registered before the other GitHub middlewares, which makes it the innermost of them: it reads
-    the path ``resolve_github_id_paths`` rewrote and a `HEAD` as the GET it is rewritten to, and
-    its refusal leaves through the version echo and the rate-limit headers as a served route's 401
-    does.
+    Registered second, after `refuse_a_missing_slash_on_github` and before the other GitHub
+    middlewares: it reads the path ``resolve_github_id_paths`` rewrote and a `HEAD` as the GET it is
+    rewritten to, and its refusal leaves through the version echo and the rate-limit headers as a
+    served route's 401 does.
     """
     try:
         await github.refuse_an_unserved_operation(request)
@@ -1191,15 +1224,6 @@ async def warn_slack_post_charset(request: Request, call_next):
     )
 
 
-#: The page Cloudflare, in front of Linear and Fireflies, answers a request carrying `Authorization`
-#: more than once with: `text/html` with no charset, CRLF line ends, 155 bytes.
-_CLOUDFLARE_REPEATED_AUTHORIZATION = (
-    "<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n"
-    "<center><h1>400 Bad Request</h1></center>\r\n<hr><center>cloudflare</center>\r\n"
-    "</body>\r\n</html>\r\n"
-)
-
-
 @_middleware(
     lambda scope: (
         _at_or_under(_url_path(scope), ("/linear", "/fireflies"))
@@ -1208,22 +1232,26 @@ _CLOUDFLARE_REPEATED_AUTHORIZATION = (
 )
 async def refuse_a_repeated_authorization_on_linear_and_fireflies(request: Request, call_next):
     """Answer a `/linear` or `/fireflies` request that carries `Authorization` more than once with
-    :data:`_CLOUDFLARE_REPEATED_AUTHORIZATION`'s 400, ahead of the route, the body and the
+    :data:`backlot.request_target.CLOUDFLARE_PAGE`'s 400, ahead of the route, the body and the
     credential. api.linear.app and api.fireflies.ai answered it on 2026-10-19 (UTC) to two copies of
     a key, a key and `nope` in either order, a key and an empty value, two empty values, three
     copies and a second header named in lower case; on `POST /graphql` with a query, with no bytes,
     with `{` and with a body past each vendor's size limit, on `GET /graphql`, on `HEAD /graphql`,
-    which declared the 155 bytes and sent none, and on `POST /nosuch` and `POST /`."""
+    which declared the 155 bytes and sent none, and on `POST /nosuch` and `POST /`. Both closed the
+    connection after it (`GET /graphql`, 2026-10-23)."""
     return Response(
-        _CLOUDFLARE_REPEATED_AUTHORIZATION.encode(),
+        request_target.CLOUDFLARE_PAGE,
         status_code=400,
-        headers={"Content-Type": "text/html"},
+        headers={"Content-Type": "text/html", "Connection": "close"},
     )
 
 
 @_middleware(lambda scope: _url_path(scope).startswith("/github"))
 async def put_a_request_id_on_github_answers(request: Request, call_next):
-    """Put an `x-github-request-id` on every `/github` answer, as real does on each one measured.
+    """Put an `x-github-request-id` on every `/github` answer the API gives, as real does on each
+    one measured. The front door's 400 for a raw byte in the target
+    (:func:`answer_a_raw_byte_in_the_request_target`) is outside it and carries none, as on real
+    (api.github.com, 2026-10-23).
 
     Registered after the other `/github` middlewares so it wraps them, and the refusals they answer
     early carry it too. Made before the route runs (``backlot.routers.github.request_id`` has why)
@@ -1285,8 +1313,9 @@ async def answer_a_google_read_sent_as_a_post(request: Request, call_next):
     answered each on `about` as it answers a `PUT` there, with its 404 page, and on 2026-10-25 so it
     answered a `PUT`, `PATCH` or `DELETE` naming `GET` there.
 
-    Registered just before ``vendor_json_media_type``, outside every middleware that reads the
-    method or the query, so they and the router see the GET.
+    Registered just inside ``answer_a_raw_byte_in_the_request_target``, whose refusals real gave
+    such a POST on Drive's `about` on 2026-10-25 as it gives a GET, and outside every other
+    middleware that reads the method or the query, so they and the router see the GET.
     """
     path = request.scope["path"]
     prefix = next(p for p in _GOOGLE_READ_OVERRIDES if path.startswith(f"{p}/"))
@@ -1301,6 +1330,23 @@ async def answer_a_google_read_sent_as_a_post(request: Request, call_next):
         request.scope["method"] = "GET"
         request.scope["query_string"] = b"&".join(part for part in (query, body) if part)
     return await call_next(request)
+
+
+@_middleware(lambda scope: request_target.SENT in scope)
+async def answer_a_raw_byte_in_the_request_target(request: Request, call_next):
+    """Answer a request whose target held a raw byte as the vendor's front door answers it
+    (``backlot.request_target.answer``), or hand it on as the request the front door reads it as.
+
+    Registered after every vendor's middleware but the JSON media type's, so it answers ahead of
+    each of them, as a front door answers ahead of the API behind it.
+    """
+    answer = request_target.answer(request.scope)
+    if answer is not None:
+        return answer
+    response = await call_next(request)
+    if request.scope.get(request_target.CLOSE):
+        response.headers["Connection"] = "close"
+    return response
 
 
 @_middleware(lambda scope: errors.has_json_media_type(_url_path(scope)))
